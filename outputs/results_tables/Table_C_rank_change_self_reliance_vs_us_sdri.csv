@@ -1,0 +1,23 @@
+species_group,species_label,mean_self_reliance,mean_risk,rank_self_reliance,rank_risk,rank_change_to_risk,abs_rank_change,interpretation
+swordfish,Swordfish,0.231351570810684,0.262659897899953,7,19,-12,12,Lower risk than self-reliance alone suggests
+clams,Clams,0.501949862178503,0.420055544175886,13,5,8,8,Higher risk than self-reliance alone suggests
+lobster,Lobster,0.267797715192071,0.496998735953145,9,2,7,7,Higher risk than self-reliance alone suggests
+cod,Cod,0.722071255554196,0.346918293997842,18,12,6,6,Higher risk than self-reliance alone suggests
+mussels,Mussels,0.0333521287389882,0.373261971584306,4,9,-5,5,Lower risk than self-reliance alone suggests
+halibut,Halibut,0.601948956249272,0.354130110943616,16,11,5,5,Higher risk than self-reliance alone suggests
+mackerel,Mackerel,0.593653934238159,0.219517683813262,15,20,-5,5,Lower risk than self-reliance alone suggests
+salmon,Salmon,0.287620374809389,0.327811532874048,10,14,-4,4,Lower risk than self-reliance alone suggests
+flatfish,Flatfish,0.845185425031771,0.287008197389965,20,16,4,4,Higher risk than self-reliance alone suggests
+pollock,Pollock,0.944751981508257,0.269752607422433,22,18,4,4,Higher risk than self-reliance alone suggests
+other_groundfish,Other groundfish,0.818261219680689,0.189072706625998,19,22,-3,3,Lower risk than self-reliance alone suggests
+trout,Trout,0.0168632611875409,0.431932016006212,2,4,-2,2,Lower risk than self-reliance alone suggests
+squid_octopus,Squid / octopus,0.0907304313593609,0.395568398117126,5,7,-2,2,Lower risk than self-reliance alone suggests
+scallops,Scallops,0.374024590041152,0.356741844552899,11,10,1,1,Higher risk than self-reliance alone suggests
+oysters,Oysters,0.471888890028307,0.331647947230093,12,13,-1,1,Lower risk than self-reliance alone suggests
+crab,Crab,0.512885761178807,0.324957974828628,14,15,-1,1,Lower risk than self-reliance alone suggests
+tilapia,Tilapia,0,0.676199711163428,1,1,0,0,Same rank under both approaches
+tuna,Tuna,0.0304473187455886,0.437351784254443,3,3,0,0,Same rank under both approaches
+shrimp,Shrimp,0.163153139702873,0.413935600138023,6,6,0,0,Same rank under both approaches
+snapper_grouper,Snapper / grouper,0.260249183229183,0.391481966924869,8,8,0,0,Same rank under both approaches
+herring,Herring,0.67077335778627,0.280681180282249,17,17,0,0,Same rank under both approaches
+sablefish,Sablefish,0.940015527360624,0.189387636917432,21,21,0,0,Same rank under both approaches

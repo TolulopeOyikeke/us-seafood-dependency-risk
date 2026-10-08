@@ -1,0 +1,2013 @@
+---
+title: "U.S. Seafood Dependency Risk Index"
+Author: Tolulope Oyikeke
+Institution: University of Maine
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    theme: readable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Prepare input tables
+
+```{r prepare-inputs}
+# Prepare U.S.-SDRI input tables
+
+# ============================================================
+# SECTION 1. PACKAGES, PATHS, AND ANALYSIS SETTINGS
+# ============================================================
+required_packages <- c('data.table', 'stringr', 'countrycode', 'ggplot2',
+                       'ggrepel', 'scales', 'zoo')
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages)) {
+  stop('Install the missing packages, then rerun from the top: install.packages(c(',
+       paste(sprintf('"%s"', missing_packages), collapse = ', '), '))')
+}
+library(data.table)
+library(stringr)
+library(countrycode)
+
+analysis_start_year <- 2009L
+analysis_end_year <- 2023L
+source_profile_year <- analysis_end_year
+scenario_year <- analysis_end_year
+scenario_reallocation_fraction <- 0.10
+scenario_species <- c('tilapia', 'lobster', 'tuna', 'sablefish')
+figure_dpi <- 600L
+
+primary_exporter_metric <- 'ndgain_combined_vuln_readiness'
+secondary_exporter_metric <- 'ndgain_vulnerability'
+combined_ndgain_weights <- c(vulnerability = 0.5, readiness_risk = 0.5)
+normalization_population <- 'core_and_extended'
+
+if (length(analysis_start_year) != 1L || length(analysis_end_year) != 1L ||
+    !is.finite(analysis_start_year) || !is.finite(analysis_end_year) ||
+    analysis_start_year != as.integer(analysis_start_year) ||
+    analysis_end_year != as.integer(analysis_end_year) ||
+    analysis_start_year > analysis_end_year) {
+  stop('Set a single integer start year and end year, with start <= end.')
+}
+analysis_years <- seq.int(analysis_start_year, analysis_end_year)
+if (!source_profile_year %in% analysis_years || !scenario_year %in% analysis_years) {
+  stop('source_profile_year and scenario_year must lie within the selected analysis period.')
+}
+if (!is.finite(scenario_reallocation_fraction) || scenario_reallocation_fraction <= 0 ||
+    scenario_reallocation_fraction >= 1) {
+  stop('scenario_reallocation_fraction must be strictly between zero and one.')
+}
+
+project_dir <- normalizePath('.', winslash = '/', mustWork = TRUE)
+data_dir <- file.path(project_dir, 'data_raw')
+processed_dir <- file.path(project_dir, 'data_processed')
+results_table_dir <- file.path(project_dir, 'outputs', 'results_tables')
+results_figure_dir <- file.path(project_dir, 'outputs', 'results_figures')
+internal_dir <- file.path(project_dir, '_revision_internal')
+diagnostics_dir <- file.path(internal_dir, 'diagnostics')
+source_profile_checks_dir <- file.path(internal_dir, 'source_profile_checks')
+scenario_checks_dir <- file.path(internal_dir, 'scenario_checks')
+ranking_checks_dir <- file.path(internal_dir, 'ranking_checks')
+
+for (p in c(processed_dir, results_table_dir, results_figure_dir, diagnostics_dir,
+            source_profile_checks_dir, scenario_checks_dir, ranking_checks_dir)) {
+  dir.create(p, recursive = TRUE, showWarnings = FALSE)
+}
+
+trade_files <- sort(list.files(
+  path = data_dir,
+  pattern = '^ANNUAL TRADE-YEAR-PRODUCT-COUNTRY.*\\.csv$',
+  full.names = TRUE,
+  recursive = TRUE
+))
+landings_file <- file.path(data_dir, 'FOSS_landings.csv')
+ndgain_vulnerability_file <- file.path(data_dir, 'ndgain_countryindex_2026',
+                                      'vulnerability', 'vulnerability.csv')
+ndgain_readiness_file <- file.path(data_dir, 'ndgain_countryindex_2026',
+                                  'readiness', 'readiness.csv')
+required_inputs <- c(trade_files, landings_file, ndgain_vulnerability_file,
+                     ndgain_readiness_file)
+if (!length(trade_files) || any(!file.exists(required_inputs))) {
+  stop('Missing raw inputs. Check the data_raw/ layout and the file settings in Section 1.')
+}
+
+input_manifest <- data.table(
+  file = substring(required_inputs, nchar(project_dir) + 2L),
+  bytes = file.info(required_inputs)$size,
+  md5 = unname(tools::md5sum(required_inputs))
+)
+fwrite(input_manifest, file.path(diagnostics_dir, 'input_manifest.csv'))
+
+run_settings <- data.table(
+  setting = c('analysis_start_year', 'analysis_end_year', 'source_profile_year',
+              'scenario_year', 'scenario_reallocation_fraction',
+              'normalization_population', 'primary_exporter_metric',
+              'secondary_exporter_metric', 'landings_join', 'coverage_period'),
+  value = as.character(c(analysis_start_year, analysis_end_year, source_profile_year,
+                         scenario_year, scenario_reallocation_fraction,
+                         normalization_population, primary_exporter_metric,
+                         secondary_exporter_metric,
+                         'unique common-name/group lookup',
+                         'selected analysis years')))
+fwrite(run_settings, file.path(diagnostics_dir, 'run_settings.csv'))
+
+# ============================================================
+# SECTION 2. FUNCTIONS
+# ============================================================
+
+to_snake <- function(x) {
+  x <- tolower(x)
+  x <- gsub('[^a-z0-9]+', '_', x)
+  x <- gsub('^_|_$', '', x)
+  x
+}
+
+num_clean <- function(x) {
+  x <- trimws(as.character(x))
+  x[x == ''] <- NA_character_
+  as.numeric(gsub(',', '', x))
+}
+
+txt_clean <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  str_squish(x)
+}
+
+minmax01 <- function(x) {
+  rng <- range(x, na.rm = TRUE)
+  if (!is.finite(rng[1]) || !is.finite(rng[2]) || rng[1] == rng[2]) {
+    return(rep(NA_real_, length(x)))
+  }
+  (x - rng[1]) / (rng[2] - rng[1])
+}
+
+validate_exporter_metric <- function(x) {
+  allowed <- c('ndgain_vulnerability', 'ndgain_combined_vuln_readiness')
+  if (!x %in% allowed) {
+    stop(
+      paste0(
+        "Invalid exporter metric '", x, "'. Valid options are: ",
+        paste(allowed, collapse = ', ')
+      )
+    )
+  }
+  x
+}
+
+validate_exporter_metric(primary_exporter_metric)
+validate_exporter_metric(secondary_exporter_metric)
+if (abs(sum(combined_ndgain_weights) - 1) > 1e-9) {
+  stop('combined_ndgain_weights must sum to 1.')
+}
+
+check_columns <- function(dt, cols, label) {
+  absent <- setdiff(cols, names(dt))
+  if (length(absent)) stop(label, ' is missing columns: ', paste(absent, collapse = ', '))
+}
+assert_unique <- function(dt, key_cols, label) {
+  dup <- dt[, .N, by = key_cols][N > 1L]
+  if (nrow(dup)) {
+    fwrite(dup, file.path(diagnostics_dir,
+                          paste0('ERROR_duplicate_', gsub('[^A-Za-z0-9]+', '_', label), '.csv')))
+    stop(label, ' has duplicate keys; see the ERROR diagnostic. No arbitrary row was chosen.')
+  }
+  invisible(TRUE)
+}
+mean_finite <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x)) mean(x) else NA_real_
+}
+max_abs_finite <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x)) max(abs(x)) else NA_real_
+}
+safe_ratio <- function(a, b) {
+  out <- rep(NA_real_, length(a))
+  ok <- is.finite(a) & is.finite(b) & b > 0
+  out[ok] <- a[ok] / b[ok]
+  out
+}
+check_source_years <- function(years, label) {
+  data.table(source = label, requested_year = analysis_years,
+             present = analysis_years %in% unique(years[!is.na(years)]))
+}
+
+# ============================================================
+# SECTION 3. IMPORT AND CLEAN NOAA TRADE DATA
+# ============================================================
+if (length(trade_files) == 0) {
+  stop('No trade files found. Check the working directory and filename pattern.')
+}
+
+annual_raw <- rbindlist(lapply(trade_files, function(f) fread(f, skip = 1)), fill = TRUE)
+setDT(annual_raw)
+trade_raw_n_before <- nrow(annual_raw)
+annual_raw <- unique(annual_raw)
+trade_exact_duplicates_removed <- trade_raw_n_before - nrow(annual_raw)
+
+annual_trade_clean <- copy(annual_raw)
+setnames(annual_trade_clean, to_snake(names(annual_trade_clean)))
+check_columns(annual_trade_clean, c('year','source','product_name','country_name',
+                                   'volume_kg','value_usd','edible_code'), 'NOAA trade data')
+if (!'calculated_duty_usd' %in% names(annual_trade_clean)) {
+  annual_trade_clean[, calculated_duty_usd := NA_real_]
+}
+
+annual_trade_clean[, year := as.integer(year)]
+annual_trade_clean[, source := txt_clean(source)]
+annual_trade_clean[, product_name := txt_clean(product_name)]
+annual_trade_clean[, country_name := txt_clean(country_name)]
+annual_trade_clean[, edible_code := txt_clean(edible_code)]
+
+annual_trade_clean[, volume_kg := num_clean(volume_kg)]
+annual_trade_clean[, value_usd := num_clean(value_usd)]
+annual_trade_clean[, calculated_duty_usd := num_clean(calculated_duty_usd)]
+
+annual_trade_clean[source %chin% c('IMPORT', 'IMPORTS', 'IMP'), source := 'IMP']
+annual_trade_clean[source %chin% c('EXPORT', 'EXPORTS', 'EXP'), source := 'EXP']
+annual_trade_clean[source %chin% c('RE-EXPORT', 'RE-EXPORTS', 'REEXPORT', 'REEXPORTS', 'REX'), source := 'REX']
+
+annual_trade_clean[, trade_flow := fcase(
+  source == 'IMP', 'imports',
+  source == 'EXP', 'exports',
+  source == 'REX', 're_exports',
+  default = 'other'
+)]
+
+annual_trade_clean[, edible_main := edible_code == 'E']
+annual_trade_clean[, unit_value_usd_per_kg := fifelse(!is.na(volume_kg) & volume_kg > 0, value_usd / volume_kg, NA_real_)]
+annual_trade_clean[, vintage_flag := fifelse(year < 1975, 'pre_1975_check', 'core_period')]
+
+trade_missing_numeric <- annual_trade_clean[
+  year %in% analysis_years,
+  .(n_rows = .N, n_missing_volume = sum(is.na(volume_kg)),
+    n_missing_value = sum(is.na(value_usd))), by = .(year, source, edible_code)
+]
+fwrite(trade_missing_numeric, file.path(diagnostics_dir, 'trade_missing_numeric.csv'))
+if (annual_trade_clean[year %in% analysis_years, any(volume_kg < 0, na.rm = TRUE)]) {
+  stop('Negative trade volumes found in the selected years; investigate before index construction.')
+}
+
+trade_key <- c('year', 'source', 'product_name', 'country_name', 'edible_code')
+
+annual_trade_clean <- annual_trade_clean[
+  ,
+  .(
+    volume_kg = sum(volume_kg, na.rm = TRUE),
+    value_usd = sum(value_usd, na.rm = TRUE),
+    calculated_duty_usd = sum(calculated_duty_usd, na.rm = TRUE)
+  ),
+  by = trade_key
+]
+
+annual_trade_clean[, trade_flow := fcase(
+  source == 'IMP', 'imports',
+  source == 'EXP', 'exports',
+  source == 'REX', 're_exports',
+  default = 'other'
+)]
+annual_trade_clean[, edible_main := edible_code == 'E']
+annual_trade_clean[, unit_value_usd_per_kg := fifelse(!is.na(volume_kg) & volume_kg > 0, value_usd / volume_kg, NA_real_)]
+annual_trade_clean[, vintage_flag := fifelse(year < 1975, 'pre_1975_check', 'core_period')]
+
+product_master <- annual_trade_clean[
+  ,
+  .(
+    first_year = min(year, na.rm = TRUE),
+    last_year = max(year, na.rm = TRUE),
+    n_years = uniqueN(year),
+    total_volume_kg = sum(volume_kg, na.rm = TRUE),
+    total_value_usd = sum(value_usd, na.rm = TRUE)
+  ),
+  by = .(product_name, edible_code)
+][order(-total_value_usd)]
+
+country_crosswalk <- unique(annual_trade_clean[, .(country_name)])
+
+
+custom_matches <- c( 'VIET NAM' = 'VNM', 'TAIWAN' = 'TWN', 'KOREA, SOUTH' = 'KOR', 'SOUTH KOREA' = 'KOR', 'KOREA REPUBLIC OF' = 'KOR', 'KOREA, NORTH' = 'PRK', 'NORTH KOREA' = 'PRK', 'RUSSIA' = 'RUS', 'RUSSIAN FEDERATION' = 'RUS', 'CHINA - HONG KONG' = 'HKG', 'HONG KONG' = 'HKG', 'YEMEN (ADEN)' = 'YEM', 'BR.INDIAN OCEAN TER.' = 'IOT', 'FED STATES OF MICRON' = 'FSM' , 'KOSOVO' = 'XKX', 'GERMANY (EAST)' = 'DEU')
+
+country_crosswalk[, iso3c := countrycode( country_name, origin = 'country.name', destination = 'iso3c', custom_match = custom_matches, warn = TRUE )]
+
+country_crosswalk_unmatched <- country_crosswalk[is.na(iso3c)][order(country_name)]
+
+assert_unique(country_crosswalk, 'country_name', 'country_crosswalk')
+annual_trade_clean <- merge(annual_trade_clean, country_crosswalk, by = 'country_name', all.x = TRUE)
+
+annual_trade_clean[, product_form := fcase(
+  grepl('CANNED|ATC|FOIL|POUCH', product_name), 'canned_packaged',
+  grepl('FILLET', product_name), 'fillet',
+  grepl('FRESH|LIVE', product_name), 'fresh_live',
+  grepl('FROZEN', product_name), 'frozen',
+  grepl('SURIMI', product_name), 'surimi',
+  grepl('ROE', product_name), 'roe',
+  grepl('MEAL|OIL', product_name), 'meal_oil',
+  grepl('PASTE|PASTES|SAUCE|PREPARATION|BREADED|PREPARED', product_name), 'prepared_other',
+  default = 'other'
+)]
+
+# ============================================================
+# SECTION 4. IMPORT AND CLEAN DOMESTIC LANDINGS DATA
+# ============================================================
+domestic_landing <- fread(landings_file, skip = 1)
+setDT(domestic_landing)
+
+domestic_landing_clean <- copy(domestic_landing)
+if (ncol(domestic_landing_clean) != 11L) {
+  stop('FOSS_landings.csv no longer has the expected 11 columns; review its schema.')
+}
+setnames(
+  domestic_landing_clean,
+  old = names(domestic_landing_clean),
+  new = c('year','state','nmfs_name','pounds','metric_tons','dollars',
+          'confidentiality','collection','scientific_name','tsn','source')
+)
+
+domestic_landing_clean[, year := as.integer(year)]
+domestic_landing_clean[, state := txt_clean(state)]
+domestic_landing_clean[, nmfs_name := txt_clean(nmfs_name)]
+domestic_landing_clean[, scientific_name := txt_clean(scientific_name)]
+domestic_landing_clean[, confidentiality := txt_clean(confidentiality)]
+domestic_landing_clean[, collection := txt_clean(collection)]
+domestic_landing_clean[, source := txt_clean(source)]
+
+domestic_landing_clean[, pounds := num_clean(pounds)]
+domestic_landing_clean[, metric_tons := num_clean(metric_tons)]
+domestic_landing_clean[, dollars := num_clean(dollars)]
+
+domestic_landing_clean <- domestic_landing_clean[collection == 'COMMERCIAL']
+
+fwrite(domestic_landing_clean[year %in% analysis_years,
+  .(n_rows = .N, n_missing_pounds = sum(is.na(pounds)),
+    n_missing_dollars = sum(is.na(dollars))), by = .(year, confidentiality)],
+  file.path(diagnostics_dir, 'landings_missing_numeric.csv'))
+
+negative_landings_raw <- domestic_landing_clean[
+  year %in% analysis_years &
+    ((!is.na(pounds) & pounds < 0) |
+     (!is.na(metric_tons) & metric_tons < 0) |
+     (!is.na(dollars) & dollars < 0))
+]
+fwrite(
+  negative_landings_raw,
+  file.path(diagnostics_dir, 'landings_negative_raw_records.csv')
+)
+fwrite(
+  negative_landings_raw[, .(
+    n_negative_rows = .N,
+    negative_pounds_sum = sum(pounds[pounds < 0], na.rm = TRUE),
+    negative_metric_tons_sum = sum(metric_tons[metric_tons < 0], na.rm = TRUE),
+    negative_dollars_sum = sum(dollars[dollars < 0], na.rm = TRUE)
+  ), by = year],
+  file.path(diagnostics_dir, 'landings_negative_raw_summary_by_year.csv')
+)
+if (nrow(negative_landings_raw) > 0L) {
+  cat(
+    'Diagnostic note: ', nrow(negative_landings_raw),
+    ' source landings rows contain at least one negative numeric value in ',
+    analysis_start_year, '-', analysis_end_year,
+    '. They are retained as reported and written to diagnostics; ',
+    'analytical species-year totals are checked after aggregation.\n',
+    sep = ''
+  )
+}
+
+landing_species_master <- domestic_landing_clean[
+  ,
+  .(
+    first_year = min(year, na.rm = TRUE),
+    last_year = max(year, na.rm = TRUE),
+    n_years = uniqueN(year),
+    total_pounds = sum(pounds, na.rm = TRUE),
+    total_metric_tons = sum(metric_tons, na.rm = TRUE),
+    total_dollars = sum(dollars, na.rm = TRUE)
+  ),
+  by = .(nmfs_name, scientific_name)
+][order(-total_dollars)]
+
+# ============================================================
+# SECTION 5. BUILD TRADE AND LANDINGS CROSSWALKS
+# ============================================================
+trade_product_crosswalk <- unique(annual_trade_clean[, .(product_name)])
+trade_product_crosswalk[, `:=`(
+  species_group = NA_character_,
+  species_subgroup = NA_character_,
+  product_form = NA_character_,
+  edible_main = NA,
+  include_main_analysis = NA,
+  notes = NA_character_
+)]
+trade_product_crosswalk[, product_name_u := toupper(product_name)]
+
+landing_species_crosswalk <- unique(domestic_landing_clean[, .(nmfs_name, scientific_name)])
+landing_species_crosswalk[, `:=`(
+  species_group = NA_character_,
+  species_subgroup = NA_character_,
+  include_main_analysis = NA,
+  notes = NA_character_
+)]
+landing_species_crosswalk[, nmfs_name_u := toupper(nmfs_name)]
+
+# ------------------------------------------------------------
+# SECTION 6. TRADE PRODUCT CROSSWALK RULES
+# ------------------------------------------------------------
+trade_product_crosswalk[, species_group := fcase(
+  grepl('UNFIT FOR HUMAN CONSUMPTION', product_name_u), 'non_food_other',
+  grepl('SPONGE|CORAL|CUTTLEBONE|FISH SCALES|FISH SOUNDS|WAXES|PEARL ESSENCE', product_name_u), 'non_food_other',
+  grepl('WHALE|SEAL OIL|MARINE ANIMAL NSPF OIL/FRACTIONS|CETACEA|SIRENIA|PINNIPEDIA|TURTLES|REPTILE', product_name_u), 'non_food_other',
+  grepl('SEAWEED|ALGAE|AGAR|CARAGEENAN', product_name_u), 'seaweed_algae',
+  grepl('SHRIMP|PRAWN', product_name_u), 'shrimp',
+  grepl('SALMON', product_name_u), 'salmon',
+  grepl('TUNA', product_name_u), 'tuna',
+  grepl('POLLOCK', product_name_u), 'pollock',
+  grepl('\\bCOD\\b', product_name_u), 'cod',
+  grepl('CRAB', product_name_u), 'crab',
+  grepl('LOBSTER', product_name_u), 'lobster',
+  grepl('TILAPIA', product_name_u), 'tilapia',
+  grepl('PANGASIUS|BASA|SWAI', product_name_u), 'pangasius_basa_swai',
+  grepl('CATFISH', product_name_u) & !grepl('PANGASIUS|BASA|SWAI', product_name_u), 'catfish_other',
+  grepl('\\bSCALLOP(S)?\\b', product_name_u), 'scallops',
+  grepl('\\bOYSTER(S)?\\b', product_name_u), 'oysters',
+  grepl('\\bCLAM(S)?\\b', product_name_u), 'clams',
+  grepl('MUSSEL', product_name_u), 'mussels',
+  grepl('SQUID|OCTOPUS|CUTTLEFISH', product_name_u), 'squid_octopus',
+  grepl('HERRING', product_name_u), 'herring',
+  grepl('MACKEREL', product_name_u), 'mackerel',
+  grepl('HALIBUT', product_name_u), 'halibut',
+  grepl('SABLEFISH', product_name_u), 'sablefish',
+  grepl('SWORDFISH', product_name_u), 'swordfish',
+  grepl('SNAPPER|GROUPER|HIND|SCAMP', product_name_u), 'snapper_grouper',
+  grepl('FLOUNDER|SOLE|PLAICE|TURBOT|FLATFISH', product_name_u), 'flatfish',
+  grepl('HAKE|HADDOCK|MONKFISH|GOOSEFISH|WOLFFISH|WHITEFISH|OCEAN PERCH|SCORPIONFISH|WHITING|CUSK|LINGCOD|BLUE WHITING|ORANGE ROUGHY', product_name_u), 'other_groundfish',
+  grepl('SHARK|DOGFISH|RAYS|SKATES', product_name_u), 'sharks_rays_skates',
+  grepl('SARDINE|SARDINELLA|SPRAT|ANCHOVY|MENHADEN|CAPELIN|BONITO|ALEWIVES|EULACHON|BUTTERFISH', product_name_u), 'small_pelagics_other',
+  grepl('DOLPHINFISH|WAHOO|OILFISH|ESCOLAR|OPAH|YELLOWTAIL|MULLET', product_name_u), 'large_pelagics_other',
+  grepl('SEA BASS|SEABREAM|COBIA|POMPANO|^BASS\\b', product_name_u), 'reef_fish_other',
+  grepl('TROUT', product_name_u), 'trout',
+  grepl('EELS|SHAD|STURGEON', product_name_u), 'eel_sturgeon_shad',
+  grepl('CONCH|ABALONE|SNAIL OTHER THAN SEA SNAIL|WHELK|COCKLES|ARK SHELLS|FROG|JELLYFISH', product_name_u), 'other_shellfish_specialty',
+  grepl('SEA CUCUMBER|SEA CUCUMBERS|URCHIN|KRILL ANTARCTIC$', product_name_u), 'sea_cucumber_urchin_other_inverts',
+  grepl('TOOTHFISH', product_name_u), 'toothfish',
+  grepl('PERCH|PIKE|PICKEREL|SMELTS|CARP|SAUGER', product_name_u), 'inland_freshwater_other',
+  grepl('CRAWFISH FRESHWATER', product_name_u), 'crawfish_freshwater',
+  grepl('MISC|NSPF PRODUCTS PREPARED DINNERS CONTAIN FISH', product_name_u), 'mixed_prepared_products',
+  grepl('PASTES|SAUCES|SOUPS|BALLS|CAKES|PUDDING|ANTIPASTO|STICKS,TYPE PRODUCTS|JUICE|ANALOG PRODUCT', product_name_u), 'mixed_prepared_products',
+  grepl('CAVIAR', product_name_u), 'caviar_misc',
+  grepl('FISH MEAL FOR HUMAN CONSUMPTION|FISH OR SHELLFISH MEAL FOR HUMAN CONSUMPTION', product_name_u), 'mixed_prepared_products',
+  grepl('FISH GLUE|ISINGLASS|AMBERGRIS|WAX SPERMACETI|SHELLS MARINE CRUDE', product_name_u), 'non_food_other',
+  grepl('KRILL .*ANIMAL FEED', product_name_u), 'non_food_other',
+  grepl('\\bMOLLUSCS NSPF\\b', product_name_u), 'unidentified_molluscs',
+  grepl('\\bCRUSTACEANS NSPF\\b', product_name_u), 'unidentified_crustaceans',
+  grepl('\\bSHELLFISH NSPF\\b', product_name_u), 'unidentified_shellfish',
+  grepl('\\bMARINE FISH NSPF\\b|\\bFISH NSPF\\b|\\bAQUATIC INVERTEBRATES NSPF\\b|\\bGROUNDFISH NSPF\\b', product_name_u), 'broad_mixed_fish',
+  default = 'review'
+)]
+
+trade_product_crosswalk[, product_form := fcase(
+  grepl('CANNED|ATC|FOIL|POUCH', product_name_u), 'canned_packaged',
+  grepl('FILLET', product_name_u), 'fillet',
+  grepl('FRESH|LIVE', product_name_u), 'fresh_live',
+  grepl('FROZEN', product_name_u), 'frozen',
+  grepl('SURIMI', product_name_u), 'surimi',
+  grepl('ROE', product_name_u), 'roe',
+  grepl('MEAL|OIL', product_name_u), 'meal_oil',
+  grepl('PASTE|SAUCE|PREPARATION|BREADED|PREPARED', product_name_u), 'prepared_other',
+  default = 'other'
+)]
+
+# ------------------------------------------------------------
+# SECTION 7. LANDINGS CROSSWALK RULES
+# ------------------------------------------------------------
+landing_species_crosswalk[, species_group := fcase(
+  grepl('SHRIMP|PRAWN', nmfs_name_u), 'shrimp',
+  grepl('SALMON', nmfs_name_u), 'salmon',
+  grepl('TUNA', nmfs_name_u), 'tuna',
+  grepl('POLLOCK', nmfs_name_u), 'pollock',
+  grepl('\\bCOD\\b', nmfs_name_u), 'cod',
+  grepl('\\b(SEA)?TROUTS?\\b', nmfs_name_u), 'trout',
+  grepl('CRAB', nmfs_name_u), 'crab',
+  grepl('LOBSTER', nmfs_name_u), 'lobster',
+  grepl('TILAPIA', nmfs_name_u), 'tilapia',
+  grepl('PANGASIUS|BASA|SWAI', nmfs_name_u), 'pangasius_basa_swai',
+  grepl('CATFISH', nmfs_name_u) & !grepl('PANGASIUS|BASA|SWAI', nmfs_name_u), 'catfish_other',
+  grepl('\\bSCALLOP(S)?\\b', nmfs_name_u), 'scallops',
+  grepl('OYSTER', nmfs_name_u), 'oysters',
+  grepl('\\bCLAM(S)?\\b', nmfs_name_u), 'clams',
+  grepl('MUSSEL', nmfs_name_u), 'mussels',
+  grepl('SQUID|OCTOPUS', nmfs_name_u), 'squid_octopus',
+  grepl('HERRING', nmfs_name_u), 'herring',
+  grepl('MACKEREL', nmfs_name_u), 'mackerel',
+  grepl('HALIBUT', nmfs_name_u), 'halibut',
+  grepl('SABLEFISH', nmfs_name_u), 'sablefish',
+  grepl('SWORDFISH', nmfs_name_u), 'swordfish',
+  grepl('SNAPPER|GROUPER|HIND|SCAMP', nmfs_name_u), 'snapper_grouper',
+  grepl('FLOUNDER|SOLE|PLAICE|TURBOT', nmfs_name_u), 'flatfish',
+  grepl('HAKE|HADDOCK|GOOSEFISH|LINGCOD|ROCKFISH|GREENLING|WOLFFISH|CABEZON|SCORPIONFISH|SCULPINS|THORNYHEAD|TOMCOD|WHITEFISH, OCEAN|GRENADIERS|WOLF-EEL|HAGFISH|PRICKLEBACK|POUT, OCEAN|REDFISH, ACADIAN|SEAROBIN|WINDOWPANE', nmfs_name_u), 'other_groundfish',
+  grepl('SHARK|STINGRAY|\\bSKATE(S)?\\b|DOGFISH', nmfs_name_u), 'sharks_rays_skates',
+  grepl('ANCHOVY|SARDINE|MENHADEN|CAPELIN|BONITO|ANCHOVIES', nmfs_name_u), 'small_pelagics_other',
+  grepl('DOLPHINFISH|WAHOO|OILFISH|LOUVAR|OPAH|ESCOLAR', nmfs_name_u), 'large_pelagics_other',
+  grepl('AMBERJACK|JACK,|JACKS|COBIA|POMPANO|LOOKDOWN|RUNNER|RUDDERFISH|SPADEFISH|BIGEYE|BUMPER|CHUB, BERMUDA|PINFISH|SCAD, BIGEYE|POMFRETS|SHEEPHEAD, CALIFORNIA|BASS,|DORY, BUCKLER', nmfs_name_u), 'reef_fish_other',
+  grepl('SEA BASS|PORGY|SCUP|SHEEPSHEAD|TAUTOG|CUNNER|TRIGGERFISH|GRUNTS|TILEFISH', nmfs_name_u), 'reef_fish_other',
+  grepl('CROAKER|DRUM|KINGFISHES|KINGFISH, NORTHERN|SPOT|BLUEFISH|MULLET|BUTTERFISH|LADYFISH|QUEENFISH|BARRACUDA|TRIPLETAIL|SURFPERCHES|WEAKFISH', nmfs_name_u), 'misc_marine_fish_other',
+  grepl('URCHIN|CUCUMBER|ECHINODERM', nmfs_name_u), 'sea_cucumber_urchin_other_inverts',
+  grepl('EEL|SHAD|STURGEON|SMELTS', nmfs_name_u), 'eel_sturgeon_shad',
+  grepl('CARP|BUFFALOFISH|DRUM, FRESHWATER|YELLOW PERCH|PIKE|BULLHEAD|PERCH, WHITE|PERCH, YELLOW', nmfs_name_u), 'inland_freshwater_other',
+  grepl('CONCH|WHELK', nmfs_name_u), 'other_shellfish_specialty',
+  grepl('WITHHELD FOR CONFIDENTIALITY', nmfs_name_u), 'withheld_confidentiality',
+  grepl('CRUSTACEANS \\*\\*|MOLLUSKS \\*\\*|VERTEBRATES, JAWED|SHARKS, CHONDRICHTHYES|ECHINODERM \\*\\*|ANEMONE|ANGELFISH|BALLOONFISH|BALLYHOOS|BEAUGREGORY|BEAUTY, ROCK|BIGEYES \\*\\*|BISCUIT, INFLATED SEA|BLENNY|BLUEHEAD|BURRFISH|BUTTERFLYFISH|CASSIOPEA|CHERUBFISH|CHITONS|CHROMIS|CORAL|CORALLIMORPH|CORALLINACEAE|COWRIE|CUTLASSFISHES|DAMSELFISH|DOCTORFISH|DRAGONETS|FLAMEFISH', nmfs_name_u), 'exclude_misc_taxa',
+  default = 'review'
+)]
+
+landing_species_crosswalk[nmfs_name_u == 'HALIBUT, CALIFORNIA', species_group := 'flatfish']
+landing_species_crosswalk[grepl('^FLATFISHES', nmfs_name_u), species_group := 'flatfish']
+
+# ============================================================
+# SECTION 8. DEFINE CORE, EXTENDED, AND EXCLUDED GROUPS
+# ============================================================
+core_groups <- c(
+  'shrimp','salmon','tuna','pollock','cod','trout','crab','lobster','tilapia',
+  'scallops','oysters','clams','mussels','squid_octopus','herring',
+  'mackerel','halibut','sablefish','swordfish','snapper_grouper',
+  'flatfish','other_groundfish'
+)
+
+extended_groups <- c(
+  'pangasius_basa_swai','catfish_other','sharks_rays_skates',
+  'small_pelagics_other','large_pelagics_other','reef_fish_other',
+  'misc_marine_fish_other','eel_sturgeon_shad',
+  'other_shellfish_specialty','sea_cucumber_urchin_other_inverts',
+  'inland_freshwater_other','toothfish','crawfish_freshwater'
+)
+
+exclude_groups_trade <- c(
+  'seaweed_algae','non_food_other','mixed_prepared_products',
+  'caviar_misc','unidentified_molluscs','unidentified_crustaceans',
+  'unidentified_shellfish','broad_mixed_fish'
+)
+
+exclude_groups_landings <- c('withheld_confidentiality','exclude_misc_taxa')
+
+trade_product_crosswalk[, include_main_analysis := species_group %in% core_groups]
+trade_product_crosswalk[, analysis_tier := fcase(
+  species_group %in% core_groups, 'core',
+  species_group %in% extended_groups, 'extended',
+  species_group %in% exclude_groups_trade, 'exclude',
+  default = 'review'
+)]
+trade_product_crosswalk[, exclude_reason := fcase(
+  species_group %in% exclude_groups_trade, species_group,
+  default = NA_character_
+)]
+trade_product_crosswalk[, edible_main := !(
+  species_group %in% c('non_food_other','seaweed_algae') |
+    !is.na(exclude_reason) |
+    grepl('UNFIT FOR HUMAN CONSUMPTION', product_name_u)
+)]
+
+landing_species_crosswalk[, include_main_analysis := species_group %in% core_groups]
+landing_species_crosswalk[, analysis_tier := fcase(
+  species_group %in% core_groups, 'core',
+  species_group %in% extended_groups, 'extended',
+  species_group %in% exclude_groups_landings, 'exclude',
+  default = 'review'
+)]
+
+# ============================================================
+# SECTION 9. BUILD SPECIES-YEAR TABLES
+# ============================================================
+assert_unique(trade_product_crosswalk, 'product_name', 'trade_product_crosswalk')
+annual_trade_grp_all <- merge(
+  annual_trade_clean,
+  trade_product_crosswalk[, .(product_name, species_group, analysis_tier)],
+  by = 'product_name', all.x = TRUE, sort = FALSE
+)
+
+landings_lookup <- unique(landing_species_crosswalk[, .(nmfs_name, species_group, analysis_tier)])
+assert_unique(landings_lookup, 'nmfs_name', 'landings_common_name_lookup')
+landings_lookup_multiplicity <- landing_species_crosswalk[,
+  .(original_lookup_rows = .N), by = nmfs_name]
+fwrite(landings_lookup_multiplicity[original_lookup_rows > 1L],
+       file.path(diagnostics_dir, 'landings_lookup_multiple_scientific_names.csv'))
+landings_join_check <- merge(domestic_landing_clean[year %in% analysis_years],
+                            landings_lookup_multiplicity, by = 'nmfs_name', all.x = TRUE)
+landings_join_check <- merge(landings_join_check, landings_lookup,
+                            by = 'nmfs_name', all.x = TRUE)
+join_impact <- landings_join_check[, .(
+  source_rows = .N,
+  rows_under_original_name_only_join = sum(original_lookup_rows),
+  retained_pounds = sum(pounds, na.rm = TRUE),
+  pounds_under_original_name_only_join = sum(pounds * original_lookup_rows, na.rm = TRUE)
+), by = .(year, species_group, analysis_tier)]
+join_impact[, excess_pounds_in_original_join :=
+             pounds_under_original_name_only_join - retained_pounds]
+fwrite(join_impact, file.path(diagnostics_dir, 'landings_join_impact.csv'))
+rm(landings_join_check)
+
+domestic_landing_grp_all <- merge(domestic_landing_clean, landings_lookup,
+                                 by = 'nmfs_name', all.x = TRUE, sort = FALSE)
+stopifnot(nrow(domestic_landing_grp_all) == nrow(domestic_landing_clean))
+
+annual_trade_grp <- annual_trade_grp_all[year %in% analysis_years]
+domestic_landing_grp <- domestic_landing_grp_all[year %in% analysis_years]
+if (anyNA(annual_trade_grp$analysis_tier) || anyNA(domestic_landing_grp$analysis_tier)) {
+  stop('Some source rows have no crosswalk tier. Inspect the mappings before continuing.')
+}
+fwrite(annual_trade_grp[, .(rows = .N, volume_kg = sum(volume_kg, na.rm = TRUE)),
+                        by = .(year, source, trade_flow, edible_code, analysis_tier)],
+       file.path(diagnostics_dir, 'trade_flow_and_edible_code_inventory.csv'))
+fwrite(annual_trade_grp[analysis_tier %in% c('core','extended') &
+                         (is.na(edible_code) | edible_code != 'E'),
+  .(rows = .N, volume_kg = sum(volume_kg, na.rm = TRUE),
+    value_usd = sum(value_usd, na.rm = TRUE)),
+  by = .(year, trade_flow, species_group, product_name, edible_code)],
+  file.path(diagnostics_dir, 'non_E_records_retained_by_original_rule.csv'))
+fwrite(landing_species_crosswalk[species_group == 'trout'],
+       file.path(diagnostics_dir, 'trout_crosswalk_current_rules.csv'))
+
+domestic_species_year <- domestic_landing_grp[
+  analysis_tier %in% c('core', 'extended'),
+  .(
+    domestic_pounds = sum(pounds, na.rm = TRUE),
+    domestic_kg = sum(pounds, na.rm = TRUE) * 0.45359237,
+    domestic_metric_tons = sum(metric_tons, na.rm = TRUE),
+    domestic_value_usd = sum(dollars, na.rm = TRUE)
+  ),
+  by = .(year, species_group, analysis_tier)
+][order(year, species_group)]
+
+negative_domestic_species_year <- domestic_species_year[
+  (!is.na(domestic_pounds) & domestic_pounds < 0) |
+    (!is.na(domestic_value_usd) & domestic_value_usd < 0)
+]
+fwrite(
+  negative_domestic_species_year,
+  file.path(diagnostics_dir, 'landings_negative_analytical_species_year.csv')
+)
+if (nrow(negative_domestic_species_year) > 0L) {
+  stop(
+    'At least one core/extended species-year has a negative aggregated landings ',
+    'quantity or value. Inspect diagnostics/landings_negative_analytical_species_year.csv.'
+  )
+}
+
+trade_country_species_year <- annual_trade_grp[
+  trade_flow == 'imports' & analysis_tier %in% c('core', 'extended'),
+  .(
+    import_volume_kg = sum(volume_kg, na.rm = TRUE),
+    import_value_usd = sum(value_usd, na.rm = TRUE)
+  ),
+  by = .(year, iso3c, country_name, species_group, analysis_tier)
+][order(year, species_group, -import_value_usd)]
+
+trade_species_year_imports <- annual_trade_grp[
+  trade_flow == 'imports' & analysis_tier %in% c('core', 'extended'),
+  .(
+    import_volume_kg = sum(volume_kg, na.rm = TRUE),
+    import_value_usd = sum(value_usd, na.rm = TRUE)
+  ),
+  by = .(year, species_group)
+][order(year, species_group)]
+
+trade_species_year_exports <- annual_trade_grp[
+  trade_flow == 'exports' & analysis_tier %in% c('core', 'extended'),
+  .(
+    export_volume_kg = sum(volume_kg, na.rm = TRUE),
+    export_value_usd = sum(value_usd, na.rm = TRUE)
+  ),
+  by = .(year, species_group)
+][order(year, species_group)]
+
+trade_coverage <- annual_trade_grp[
+  trade_flow == 'imports',
+  .(
+    import_value_usd = sum(value_usd, na.rm = TRUE),
+    import_volume_kg = sum(volume_kg, na.rm = TRUE),
+    n_species_groups = uniqueN(species_group[!is.na(species_group)])
+  ),
+  by = analysis_tier
+][order(-import_value_usd)]
+trade_coverage[, value_share := import_value_usd / sum(import_value_usd)]
+trade_coverage[, volume_share := import_volume_kg / sum(import_volume_kg)]
+
+domestic_coverage <- domestic_landing_grp[
+  ,
+  .(
+    domestic_value_usd = sum(dollars, na.rm = TRUE),
+    domestic_pounds = sum(pounds, na.rm = TRUE),
+    n_species_groups = uniqueN(species_group[!is.na(species_group)])
+  ),
+  by = analysis_tier
+][order(-domestic_value_usd)]
+domestic_coverage[, value_share := domestic_value_usd / sum(domestic_value_usd)]
+domestic_coverage[, pounds_share := domestic_pounds / sum(domestic_pounds)]
+
+trade_groups <- unique(trade_species_year_imports[, .(species_group)])
+dom_groups <- unique(domestic_species_year[, .(species_group)])
+species_overlap <- merge(trade_groups[, in_trade := TRUE], dom_groups[, in_domestic := TRUE], by = 'species_group', all = TRUE)
+
+# ============================================================
+# SECTION 10. IMPORT AND RESHAPE ND-GAIN DATA
+# ============================================================
+ndgain_vuln <- fread(ndgain_vulnerability_file, header = TRUE)
+ndgain_readiness <- fread(ndgain_readiness_file, header = TRUE)
+
+year_cols_vuln <- setdiff(names(ndgain_vuln), c('ISO3', 'Name'))
+year_cols_readiness <- setdiff(names(ndgain_readiness), c('ISO3', 'Name'))
+
+ndgain_vuln_long <- melt(
+  ndgain_vuln,
+  id.vars = c('ISO3', 'Name'),
+  measure.vars = year_cols_vuln,
+  variable.name = 'year',
+  value.name = 'ndgain_vulnerability'
+)
+ndgain_readiness_long <- melt(
+  ndgain_readiness,
+  id.vars = c('ISO3', 'Name'),
+  measure.vars = year_cols_readiness,
+  variable.name = 'year',
+  value.name = 'ndgain_readiness'
+)
+
+ndgain_vuln_long[, year := as.integer(as.character(year))]
+ndgain_readiness_long[, year := as.integer(as.character(year))]
+
+setnames(ndgain_vuln_long, c('ISO3', 'Name'), c('iso3c', 'country_name_ndgain'))
+setnames(ndgain_readiness_long, c('ISO3', 'Name'), c('iso3c', 'country_name_ndgain'))
+
+source_year_coverage <- rbindlist(list(
+  check_source_years(annual_trade_clean[trade_flow == 'imports', year], 'trade_imports'),
+  check_source_years(annual_trade_clean[trade_flow == 'exports', year], 'trade_exports'),
+  check_source_years(domestic_landing_clean$year, 'commercial_landings'),
+  check_source_years(ndgain_vuln_long[is.finite(ndgain_vulnerability), year], 'NDGAIN_vulnerability'),
+  check_source_years(ndgain_readiness_long[is.finite(ndgain_readiness), year], 'NDGAIN_readiness')
+))
+fwrite(source_year_coverage, file.path(diagnostics_dir, 'source_year_coverage.csv'))
+if (any(!source_year_coverage$present)) {
+  stop('The requested period includes years unavailable in at least one input source. ',
+       'See source_year_coverage.csv. Change the year settings or provide the missing inputs; ',
+       'the workflow will not silently shorten your period or invent data.')
+}
+assert_unique(ndgain_vuln_long, c('iso3c','year'), 'NDGAIN_vulnerability')
+assert_unique(ndgain_readiness_long, c('iso3c','year'), 'NDGAIN_readiness')
+
+ndgain_vuln_long <- ndgain_vuln_long[year >= analysis_start_year & year <= analysis_end_year]
+ndgain_readiness_long <- ndgain_readiness_long[year >= analysis_start_year & year <= analysis_end_year]
+
+ndgain_long <- merge(
+  ndgain_vuln_long,
+  ndgain_readiness_long[, .(iso3c, year, ndgain_readiness)],
+  by = c('iso3c', 'year'),
+  all = TRUE
+)
+
+# ndgain_vulnerability contains the ND-GAIN country-year
+# overall vulnerability score.
+
+# Reverse-code readiness as (1 - readiness) so that both terms
+# have the same risk direction: higher values indicate greater risk.
+ndgain_long[, ndgain_combined_vuln_readiness := fifelse(
+  !is.na(ndgain_vulnerability) & !is.na(ndgain_readiness),
+  (combined_ndgain_weights['vulnerability'] * ndgain_vulnerability) +
+    (combined_ndgain_weights['readiness_risk'] * (1 - ndgain_readiness)),
+  NA_real_
+)]
+
+# ============================================================
+# SECTION 11. MERGE ND-GAIN EXPORTER-RISK DATA ONTO COUNTRY-SPECIES-YEAR IMPORT TABLE
+# ============================================================
+trade_country_species_year_nd <- copy(trade_country_species_year)[year >= analysis_start_year & year <= analysis_end_year]
+
+trade_country_species_year_risk <- merge(
+  trade_country_species_year_nd,
+  ndgain_long,
+  by = c('iso3c', 'year'),
+  all.x = TRUE
+)
+
+ndgain_unmatched_countries <- unique(
+  trade_country_species_year_risk[is.na(ndgain_vulnerability), .(iso3c, country_name)]
+)[order(country_name)]
+
+ndgain_readiness_unmatched_countries <- unique(
+  trade_country_species_year_risk[is.na(ndgain_readiness), .(iso3c, country_name)]
+)[order(country_name)]
+
+ndgain_combined_unmatched_countries <- unique(
+  trade_country_species_year_risk[is.na(ndgain_combined_vuln_readiness), .(iso3c, country_name)]
+)[order(country_name)]
+
+trade_country_species_year_risk <- merge(
+  trade_country_species_year_risk,
+  trade_species_year_imports[year >= analysis_start_year & year <= analysis_end_year],
+  by = c('year', 'species_group'),
+  suffixes = c('', '_species_total'),
+  all.x = TRUE
+)
+
+setnames(
+  trade_country_species_year_risk,
+  old = c('import_volume_kg_species_total', 'import_value_usd_species_total'),
+  new = c('species_import_volume_kg', 'species_import_value_usd')
+)
+
+# ============================================================
+# SECTION 12. COMPUTE IMPORT SHARES AND SUPPLIER CONCENTRATION
+# ============================================================
+trade_country_species_year_risk[, import_share_volume := fifelse(
+  !is.na(species_import_volume_kg) & species_import_volume_kg > 0,
+  import_volume_kg / species_import_volume_kg,
+  NA_real_
+)]
+
+trade_country_species_year_risk[, import_share_value := fifelse(
+  !is.na(species_import_value_usd) & species_import_value_usd > 0,
+  import_value_usd / species_import_value_usd,
+  NA_real_
+)]
+
+supplier_concentration <- trade_country_species_year_risk[
+  ,
+  .(
+    supplier_hhi_volume = sum(import_share_volume^2, na.rm = TRUE),
+    supplier_hhi_value = sum(import_share_value^2, na.rm = TRUE),
+    n_suppliers = uniqueN(iso3c[!is.na(import_share_volume) & import_share_volume > 0])
+  ),
+  by = .(year, species_group)
+]
+
+# ============================================================
+# SECTION 13. COMPUTE WEIGHTED EXPORTER RISK
+# ============================================================
+exporter_risk_species_year_raw <- trade_country_species_year_risk[
+  ,
+  .(
+    weighted_ndgain_vulnerability_volume_raw = sum(import_share_volume * ndgain_vulnerability, na.rm = TRUE),
+    weighted_ndgain_vulnerability_value_raw = sum(import_share_value * ndgain_vulnerability, na.rm = TRUE),
+    weighted_ndgain_combined_vuln_readiness_volume_raw = sum(import_share_volume * ndgain_combined_vuln_readiness, na.rm = TRUE),
+    weighted_ndgain_combined_vuln_readiness_value_raw = sum(import_share_value * ndgain_combined_vuln_readiness, na.rm = TRUE),
+
+    share_with_ndgain_vulnerability = sum(import_share_volume[!is.na(ndgain_vulnerability)], na.rm = TRUE),
+    share_with_ndgain_vulnerability_value = sum(import_share_value[!is.na(ndgain_vulnerability)], na.rm = TRUE),
+    share_with_ndgain_combined_vuln_readiness = sum(import_share_volume[!is.na(ndgain_combined_vuln_readiness)], na.rm = TRUE),
+    share_with_ndgain_combined_vuln_readiness_value = sum(import_share_value[!is.na(ndgain_combined_vuln_readiness)], na.rm = TRUE)
+  ),
+  by = .(year, species_group)
+]
+
+exporter_risk_species_year <- copy(exporter_risk_species_year_raw)
+
+exporter_risk_species_year[, weighted_ndgain_vulnerability_volume := fifelse(
+  share_with_ndgain_vulnerability > 0,
+  weighted_ndgain_vulnerability_volume_raw / share_with_ndgain_vulnerability,
+  NA_real_
+)]
+exporter_risk_species_year[, weighted_ndgain_vulnerability_value := fifelse(
+  share_with_ndgain_vulnerability_value > 0,
+  weighted_ndgain_vulnerability_value_raw / share_with_ndgain_vulnerability_value,
+  NA_real_
+)]
+
+exporter_risk_species_year[, weighted_ndgain_combined_vuln_readiness_volume := fifelse(
+  share_with_ndgain_combined_vuln_readiness > 0,
+  weighted_ndgain_combined_vuln_readiness_volume_raw / share_with_ndgain_combined_vuln_readiness,
+  NA_real_
+)]
+exporter_risk_species_year[, weighted_ndgain_combined_vuln_readiness_value := fifelse(
+  share_with_ndgain_combined_vuln_readiness_value > 0,
+  weighted_ndgain_combined_vuln_readiness_value_raw / share_with_ndgain_combined_vuln_readiness_value,
+  NA_real_
+)]
+
+exporter_metric_map <- list(
+  ndgain_vulnerability = list(
+    volume = 'weighted_ndgain_vulnerability_volume',
+    value = 'weighted_ndgain_vulnerability_value',
+    share_volume = 'share_with_ndgain_vulnerability',
+    share_value = 'share_with_ndgain_vulnerability_value'
+  ),
+  ndgain_combined_vuln_readiness = list(
+    volume = 'weighted_ndgain_combined_vuln_readiness_volume',
+    value = 'weighted_ndgain_combined_vuln_readiness_value',
+    share_volume = 'share_with_ndgain_combined_vuln_readiness',
+    share_value = 'share_with_ndgain_combined_vuln_readiness_value'
+  )
+)
+
+primary_metric_cols <- exporter_metric_map[[primary_exporter_metric]]
+secondary_metric_cols <- exporter_metric_map[[secondary_exporter_metric]]
+
+exporter_risk_species_year[, exporter_metric_primary := primary_exporter_metric]
+exporter_risk_species_year[, exporter_metric_secondary := secondary_exporter_metric]
+
+exporter_risk_species_year[, weighted_exporter_risk_volume := get(primary_metric_cols$volume)]
+exporter_risk_species_year[, weighted_exporter_risk_value := get(primary_metric_cols$value)]
+exporter_risk_species_year[, share_with_exporter_risk := get(primary_metric_cols$share_volume)]
+exporter_risk_species_year[, share_with_exporter_risk_value := get(primary_metric_cols$share_value)]
+
+exporter_risk_species_year[, weighted_secondary_exporter_risk_volume := get(secondary_metric_cols$volume)]
+exporter_risk_species_year[, weighted_secondary_exporter_risk_value := get(secondary_metric_cols$value)]
+exporter_risk_species_year[, share_with_secondary_exporter_risk := get(secondary_metric_cols$share_volume)]
+exporter_risk_species_year[, share_with_secondary_exporter_risk_value := get(secondary_metric_cols$share_value)]
+
+# ============================================================
+# SECTION 14. COMPUTE EXPORT-ADJUSTED IMPORT DEPENDENCE
+# ============================================================
+domestic_species_year_nd <- copy(domestic_species_year)[year >= analysis_start_year & year <= analysis_end_year]
+
+species_year_base <- Reduce(
+  function(x, y) merge(x, y, by = c('year', 'species_group'), all = TRUE),
+  list(
+    trade_species_year_imports[year >= analysis_start_year & year <= analysis_end_year],
+    trade_species_year_exports[year >= analysis_start_year & year <= analysis_end_year],
+    domestic_species_year_nd[, .(year, species_group, domestic_kg, domestic_value_usd)]
+  )
+)
+
+species_year_base[is.na(import_volume_kg), import_volume_kg := 0]
+species_year_base[is.na(import_value_usd), import_value_usd := 0]
+species_year_base[is.na(export_volume_kg), export_volume_kg := 0]
+species_year_base[is.na(export_value_usd), export_value_usd := 0]
+species_year_base[is.na(domestic_kg), domestic_kg := 0]
+species_year_base[is.na(domestic_value_usd), domestic_value_usd := 0]
+
+species_year_base[, domestic_available_kg := pmax(domestic_kg - export_volume_kg, 0)]
+species_year_base[, domestic_available_value := pmax(domestic_value_usd - export_value_usd, 0)]
+
+species_year_base[, import_dependence_volume := fifelse(
+  (import_volume_kg + domestic_available_kg) > 0,
+  import_volume_kg / (import_volume_kg + domestic_available_kg),
+  NA_real_
+)]
+
+species_year_base[, import_dependence_value := fifelse(
+  (import_value_usd + domestic_available_value) > 0,
+  import_value_usd / (import_value_usd + domestic_available_value),
+  NA_real_
+)]
+
+species_year_base[, import_dependence_volume_simple := fifelse(
+  (import_volume_kg + domestic_kg) > 0,
+  import_volume_kg / (import_volume_kg + domestic_kg),
+  NA_real_
+)]
+
+species_year_base[, self_reliance_volume := 1 - import_dependence_volume]
+
+# ============================================================
+# SECTION 15. BUILD SPECIES-YEAR RISK INPUT TABLE
+# ============================================================
+species_year_risk_inputs <- Reduce(
+  function(x, y) merge(x, y, by = c('year', 'species_group'), all = TRUE),
+  list(species_year_base, supplier_concentration, exporter_risk_species_year)
+)
+
+species_year_risk_inputs[, import_dependence_norm := minmax01(import_dependence_volume)]
+species_year_risk_inputs[, concentration_norm := minmax01(supplier_hhi_volume)]
+species_year_risk_inputs[, exporter_risk_norm := minmax01(weighted_exporter_risk_volume)]
+species_year_risk_inputs[, secondary_exporter_risk_norm := minmax01(weighted_secondary_exporter_risk_volume)]
+
+species_year_risk_inputs[, seafood_dependency_risk_index := (
+  import_dependence_norm * concentration_norm * exporter_risk_norm
+)^(1/3)]
+
+species_year_risk_inputs[, seafood_dependency_risk_index_secondary := (
+  import_dependence_norm * concentration_norm * secondary_exporter_risk_norm
+)^(1/3)]
+
+normalization_columns <- c(
+  import_dependence_volume = 'import_dependence_norm',
+  supplier_hhi_volume = 'concentration_norm',
+  weighted_exporter_risk_volume = 'exporter_risk_norm',
+  weighted_secondary_exporter_risk_volume = 'secondary_exporter_risk_norm'
+)
+normalization_reference <- rbindlist(lapply(names(normalization_columns), function(nm) {
+  vals <- species_year_risk_inputs[[nm]]
+  good <- is.finite(vals)
+  data.table(input_column = nm, normalized_column = unname(normalization_columns[nm]),
+             minimum = if (any(good)) min(vals[good]) else NA_real_,
+             maximum = if (any(good)) max(vals[good]) else NA_real_,
+             n_finite = sum(good),
+             n_reference_groups = uniqueN(species_year_risk_inputs$species_group[good]),
+             start_year = analysis_start_year, end_year = analysis_end_year,
+             reference_population = normalization_population)
+}))
+fwrite(normalization_reference, file.path(diagnostics_dir, 'normalization_reference.csv'))
+fwrite(unique(species_year_risk_inputs[, .(species_group)]),
+       file.path(diagnostics_dir, 'normalization_reference_groups.csv'))
+
+assert_unique(species_year_risk_inputs, c('year','species_group'), 'species_year_risk_inputs')
+share_check <- trade_country_species_year_risk[, .(
+  import_total_kg = unique(species_import_volume_kg)[1],
+  share_sum = sum(import_share_volume, na.rm = TRUE),
+  raw_country_rows = .N,
+  missing_country_codes = sum(is.na(iso3c))
+), by = .(year, species_group)]
+share_check[, shares_valid := import_total_kg <= 0 | abs(share_sum - 1) < 1e-8]
+fwrite(share_check, file.path(diagnostics_dir, 'import_share_checks.csv'))
+if (any(!share_check$shares_valid, na.rm = TRUE)) {
+  stop('Import shares do not sum to one; see import_share_checks.csv.')
+}
+fwrite(trade_country_species_year_risk[is.na(iso3c) |
+                  is.na(ndgain_combined_vuln_readiness)],
+       file.path(diagnostics_dir, 'country_risk_unmatched_records.csv'))
+fwrite(unique(trade_country_species_year_risk[, .(iso3c, country_name)])[
+  !is.na(iso3c), .(n_labels = uniqueN(country_name),
+                   labels = paste(sort(unique(country_name)), collapse = ' | ')),
+  by = iso3c][n_labels > 1L],
+  file.path(diagnostics_dir, 'multiple_country_labels_per_ISO.csv'))
+fwrite(species_year_risk_inputs[, .(
+  year, species_group, import_volume_kg, export_volume_kg, domestic_kg,
+  domestic_available_kg,
+  exports_exceed_landings_proxy = export_volume_kg > domestic_kg,
+  zero_domestic_availability_proxy = domestic_available_kg == 0,
+  share_with_exporter_risk,
+  any_component_at_reference_minimum = import_dependence_norm == 0 |
+    concentration_norm == 0 | exporter_risk_norm == 0,
+  index_missing = !is.finite(seafood_dependency_risk_index)
+)], file.path(diagnostics_dir, 'species_year_data_flags.csv'))
+
+# ============================================================
+# SECTION 16. SAVE OUTPUTS
+# ============================================================
+write_processed <- function(x, filename) fwrite(x, file.path(processed_dir, filename))
+
+write_processed(domestic_species_year, "domestic_species_year.csv")
+write_processed(trade_country_species_year, "trade_country_species_year.csv")
+write_processed(trade_species_year_imports, "trade_species_year_imports.csv")
+write_processed(trade_species_year_exports, "trade_species_year_exports.csv")
+write_processed(trade_coverage, "trade_coverage.csv")
+write_processed(domestic_coverage, "domestic_coverage.csv")
+write_processed(species_overlap, "species_overlap.csv")
+write_processed(ndgain_long, "ndgain_long.csv")
+write_processed(trade_country_species_year_risk, "trade_country_species_year_risk.csv")
+write_processed(supplier_concentration, "supplier_concentration_species_year.csv")
+write_processed(exporter_risk_species_year, "exporter_risk_species_year.csv")
+write_processed(species_year_risk_inputs, "species_year_risk_inputs.csv")
+write_processed(trade_product_crosswalk, "trade_product_crosswalk.csv")
+write_processed(landing_species_crosswalk, "landing_species_crosswalk.csv")
+
+write_processed(
+  data.table(
+    primary_exporter_metric = primary_exporter_metric,
+    secondary_exporter_metric = secondary_exporter_metric,
+    combined_vulnerability_weight = combined_ndgain_weights["vulnerability"],
+    combined_readiness_risk_weight = combined_ndgain_weights["readiness_risk"]
+  ),
+  "exporter_risk_settings.csv"
+)
+
+fwrite(data.table(check = 'exact_duplicate_trade_rows_removed',
+                  value = trade_exact_duplicates_removed),
+       file.path(diagnostics_dir, 'input_deduplication.csv'))
+fwrite(country_crosswalk, file.path(processed_dir, 'country_crosswalk.csv'))
+message('Prepared U.S.-SDRI input tables in ', processed_dir)
+
+```
+
+# Generate tables and figures
+
+```{r generate-results}
+# Generate U.S.-SDRI tables and figures
+
+library(data.table)
+library(ggplot2)
+library(ggrepel)
+library(scales)
+library(zoo)
+
+# =========================================================
+# SECTION 1. INPUTS AND OUTPUT FOLDERS
+# =========================================================
+if (!exists('analysis_years')) {
+  stop('Run prepare-inputs first.')
+}
+
+dir.create(results_table_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(results_figure_dir, recursive = TRUE, showWarnings = FALSE)
+
+read_processed <- function(filename, required = TRUE) {
+  path <- file.path(processed_dir, filename)
+  if (!file.exists(path)) {
+    if (required) stop('Missing required file: ', path)
+    return(NULL)
+  }
+  fread(path)
+}
+
+species_year_risk_inputs <- read_processed('species_year_risk_inputs.csv')
+trade_coverage <- read_processed('trade_coverage.csv')
+domestic_coverage <- read_processed('domestic_coverage.csv')
+trade_product_crosswalk <- read_processed('trade_product_crosswalk.csv', required = FALSE)
+landing_species_crosswalk <- read_processed('landing_species_crosswalk.csv', required = FALSE)
+trade_country_species_year_risk <- read_processed('trade_country_species_year_risk.csv')
+
+# =========================================================
+# SECTION 2. HELPERS, SETTINGS, AND SPECIES LABELS
+# =========================================================
+minmax01 <- function(x) {
+  rng <- range(x, na.rm = TRUE)
+  if (!is.finite(rng[1]) || !is.finite(rng[2]) || rng[1] == rng[2]) {
+    return(rep(NA_real_, length(x)))
+  }
+  (x - rng[1]) / (rng[2] - rng[1])
+}
+
+metric_label_map <- c(
+  ndgain_vulnerability = 'ND-GAIN overall vulnerability score',
+  ndgain_combined_vuln_readiness = 'Exporter risk: ND-GAIN overall vulnerability + reverse-coded readiness'
+)
+
+exporter_settings <- NULL
+exporter_settings_path <- file.path(processed_dir, 'exporter_risk_settings.csv')
+if (file.exists(exporter_settings_path)) {
+  exporter_settings <- fread(exporter_settings_path)
+}
+
+primary_exporter_metric <- if (!is.null(exporter_settings) && 'primary_exporter_metric' %in% names(exporter_settings)) {
+  exporter_settings$primary_exporter_metric[1]
+} else {
+  'ndgain_combined_vuln_readiness'
+}
+
+secondary_exporter_metric <- if (!is.null(exporter_settings) && 'secondary_exporter_metric' %in% names(exporter_settings)) {
+  exporter_settings$secondary_exporter_metric[1]
+} else {
+  'ndgain_vulnerability'
+}
+
+primary_exporter_metric_label <- if (primary_exporter_metric %in% names(metric_label_map)) metric_label_map[[primary_exporter_metric]] else primary_exporter_metric
+secondary_exporter_metric_label <- if (secondary_exporter_metric %in% names(metric_label_map)) metric_label_map[[secondary_exporter_metric]] else secondary_exporter_metric
+
+main_species <- core_groups  # Same intentional core selection, defined once above.
+
+pretty_species <- c(
+  shrimp = 'Shrimp',
+  salmon = 'Salmon',
+  tuna = 'Tuna',
+  pollock = 'Pollock',
+  cod = 'Cod',
+  crab = 'Crab',
+  lobster = 'Lobster',
+  tilapia = 'Tilapia',
+  scallops = 'Scallops',
+  oysters = 'Oysters',
+  clams = 'Clams',
+  trout = 'Trout',
+  mussels = 'Mussels',
+  squid_octopus = 'Squid / octopus',
+  herring = 'Herring',
+  mackerel = 'Mackerel',
+  halibut = 'Halibut',
+  sablefish = 'Sablefish',
+  swordfish = 'Swordfish',
+  snapper_grouper = 'Snapper / grouper',
+  flatfish = 'Flatfish',
+  other_groundfish = 'Other groundfish'
+)
+
+species_main <- copy(species_year_risk_inputs)[species_group %in% main_species]
+species_main[, species_label := pretty_species[species_group]]
+
+main_panel_coverage <- species_main[, .(
+  n_rows = .N, n_years_observed = uniqueN(year),
+  n_requested_years = length(analysis_years),
+  n_finite_index_years = sum(is.finite(seafood_dependency_risk_index)),
+  missing_calendar_years = paste(setdiff(analysis_years, year), collapse = ';')
+), by = species_group]
+main_panel_coverage <- merge(data.table(species_group = main_species),
+                             main_panel_coverage, by = 'species_group', all.x = TRUE)
+main_panel_coverage[is.na(n_rows), `:=`(
+  n_rows = 0L, n_years_observed = 0L, n_requested_years = length(analysis_years),
+  n_finite_index_years = 0L, missing_calendar_years = paste(analysis_years, collapse = ';')
+)]
+fwrite(main_panel_coverage, file.path(diagnostics_dir, 'main_panel_coverage.csv'))
+if (!nrow(species_main) || !any(is.finite(species_main$seafood_dependency_risk_index))) {
+  stop('No finite core-group scores for this period. Review normalization and source coverage.')
+}
+year_label <- paste0(analysis_start_year, '–', analysis_end_year)
+
+# =========================================================
+# SECTION 3. TABLE A. DATA AND SPECIES COVERAGE
+# =========================================================
+check_columns(trade_coverage, 'n_species_groups', 'study-period trade coverage')
+check_columns(domestic_coverage, 'n_species_groups', 'study-period landings coverage')
+trade_cov_tbl <- trade_coverage[, .(
+  source = 'Trade imports', analysis_tier, n_species_groups,
+  value_share, quantity_share = volume_share
+)]
+domestic_cov_tbl <- domestic_coverage[, .(
+  source = 'Domestic landings', analysis_tier, n_species_groups,
+  value_share, quantity_share = pounds_share
+)]
+table1_coverage <- rbindlist(list(trade_cov_tbl, domestic_cov_tbl))
+table1_coverage[, `:=`(start_year = analysis_start_year, end_year = analysis_end_year)]
+setcolorder(table1_coverage, c('source','analysis_tier','n_species_groups',
+                             'start_year','end_year','value_share','quantity_share'))
+
+# =========================================================
+# SECTION 4. TABLES B AND D. COMPONENT VALUES AND ROBUSTNESS DIAGNOSTICS
+# =========================================================
+species_rank_mean <- species_main[
+  ,
+  .(
+    mean_risk = mean_finite(seafood_dependency_risk_index),
+    mean_secondary_risk = mean_finite(seafood_dependency_risk_index_secondary),
+    mean_import_dependence = mean_finite(import_dependence_volume),
+    mean_self_reliance = mean_finite(self_reliance_volume),
+    mean_hhi = mean_finite(supplier_hhi_volume),
+    mean_exporter_risk = mean_finite(weighted_exporter_risk_volume),
+    mean_secondary_exporter_risk = mean_finite(weighted_secondary_exporter_risk_volume),
+    mean_export_share_adjustment = mean(import_dependence_volume - import_dependence_volume_simple, na.rm = TRUE),
+    mean_primary_metric_coverage = mean_finite(share_with_exporter_risk),
+    mean_secondary_metric_coverage = mean_finite(share_with_secondary_exporter_risk),
+    n_years = uniqueN(year),
+    n_index_years = sum(is.finite(seafood_dependency_risk_index))
+  ),
+  by = .(species_group, species_label)
+][order(-mean_risk, na.last = TRUE)]
+
+species_rank_mean[, mean_exporter_risk_coverage := mean_primary_metric_coverage]
+
+table2_species_components <- species_rank_mean[
+  ,
+  .(
+    species_group,
+    species_label,
+    mean_import_dependence,
+    mean_self_reliance,
+    mean_hhi,
+    mean_exporter_risk,
+    mean_risk,
+    mean_secondary_risk,
+    mean_primary_metric_coverage,
+    n_years
+  )
+][order(-mean_risk, na.last = TRUE)]
+
+species_rank_components <- species_rank_mean[
+  ,
+  .(
+    species_group,
+    species_label,
+    mean_risk,
+    mean_secondary_risk,
+    mean_import_dependence,
+    mean_self_reliance,
+    mean_hhi,
+    mean_exporter_risk,
+    mean_secondary_exporter_risk,
+    mean_primary_metric_coverage,
+    mean_secondary_metric_coverage,
+    n_years,
+    rank_risk = frank(-mean_risk, ties.method = 'min', na.last = 'keep'),
+    rank_dependence = frank(-mean_import_dependence, ties.method = 'min', na.last = 'keep'),
+    rank_self_reliance = frank(mean_self_reliance, ties.method = 'min', na.last = 'keep'),
+    rank_hhi = frank(-mean_hhi, ties.method = 'min', na.last = 'keep'),
+    rank_exporter_risk = frank(-mean_exporter_risk, ties.method = 'min', na.last = 'keep')
+  )
+][order(rank_risk)]
+
+# =========================================================
+# SECTION 5. TABLE C. RANK CHANGE FROM SELF-RELIANCE TO U.S.-SDRI
+# =========================================================
+supp_table_rank_change <- species_rank_components[
+  ,
+  .(
+    species_group,
+    species_label,
+    mean_self_reliance,
+    mean_risk,
+    rank_self_reliance,
+    rank_risk,
+    rank_change_to_risk = rank_self_reliance - rank_risk,
+    abs_rank_change = abs(rank_self_reliance - rank_risk),
+    interpretation = fcase(
+      (rank_self_reliance - rank_risk) > 0, 'Higher risk than self-reliance alone suggests',
+      (rank_self_reliance - rank_risk) < 0, 'Lower risk than self-reliance alone suggests',
+      default = 'Same rank under both approaches'
+    )
+  )
+][order(-abs_rank_change, rank_risk)]
+
+# =========================================================
+# SECTION 6. TABLE E. ANNUAL RANKS AND TOP SPECIES-YEAR OBSERVATIONS
+# =========================================================
+species_rank_annual <- species_main[
+  ,
+  .(
+    risk_index = mean_finite(seafood_dependency_risk_index),
+    risk_index_secondary = mean_finite(seafood_dependency_risk_index_secondary),
+    import_dependence = mean_finite(import_dependence_volume),
+    self_reliance = mean_finite(self_reliance_volume),
+    supplier_hhi = mean_finite(supplier_hhi_volume),
+    exporter_risk = mean_finite(weighted_exporter_risk_volume)
+  ),
+  by = .(year, species_group, species_label)
+][order(year, -risk_index)]
+
+species_rank_annual[, annual_rank := frank(-risk_index, ties.method = 'min', na.last = 'keep'), by = year]
+
+top_risk_species_years <- species_main[
+  order(-seafood_dependency_risk_index, na.last = TRUE),
+  .(
+    rank = seq_len(.N),
+    year,
+    species_group,
+    species_label,
+    import_volume_kg,
+    export_volume_kg,
+    domestic_landings_kg = domestic_kg,
+    domestic_available_kg,
+    import_dependence = import_dependence_volume,
+    self_reliance = self_reliance_volume,
+    supplier_concentration_hhi = supplier_hhi_volume,
+    exporter_risk = weighted_exporter_risk_volume,
+    exporter_risk_coverage = share_with_exporter_risk,
+    us_sdri = seafood_dependency_risk_index
+  )
+][seq_len(min(50L, .N))]
+
+# =========================================================
+# SECTION 7. TABLE F. TEMPORAL VARIABILITY
+# =========================================================
+calc_temporal_variability <- function(dt) {
+  dt <- copy(dt)[order(year)]
+
+  risk_vals <- dt$seafood_dependency_risk_index
+  risk_vals_valid <- risk_vals[is.finite(risk_vals)]
+  annual_changes <- abs(diff(risk_vals))
+  consecutive <- diff(dt$year) == 1L
+  annual_changes <- annual_changes[consecutive & is.finite(annual_changes)]
+
+  component_sds <- c(
+    import_dependence = sd(dt$import_dependence_norm, na.rm = TRUE),
+    supplier_concentration = sd(dt$concentration_norm, na.rm = TRUE),
+    exporter_risk = sd(dt$exporter_risk_norm, na.rm = TRUE)
+  )
+  component_sds[is.nan(component_sds)] <- NA_real_
+  dominant_component <- if (all(is.na(component_sds))) {
+    NA_character_
+  } else {
+    names(component_sds)[which.max(ifelse(is.na(component_sds), -Inf, component_sds))]
+  }
+
+  mean_risk <- if (length(risk_vals_valid) > 0) mean(risk_vals_valid) else NA_real_
+  sd_risk <- if (length(risk_vals_valid) > 1) sd(risk_vals_valid) else NA_real_
+  min_risk <- if (length(risk_vals_valid) > 0) min(risk_vals_valid) else NA_real_
+  max_risk <- if (length(risk_vals_valid) > 0) max(risk_vals_valid) else NA_real_
+
+  data.table(
+    species_label = dt$species_label[1],
+    mean_risk = mean_risk,
+    sd_risk = sd_risk,
+    cv_risk = fifelse(!is.na(mean_risk) & mean_risk > 0, sd_risk / mean_risk, NA_real_),
+    min_risk = min_risk,
+    max_risk = max_risk,
+    range_risk = fifelse(!is.na(max_risk) & !is.na(min_risk), max_risk - min_risk, NA_real_),
+    mean_abs_annual_change = if (length(annual_changes) > 0) mean(annual_changes) else NA_real_,
+    max_abs_annual_change = if (length(annual_changes) > 0) max(annual_changes) else NA_real_,
+    sd_import_dependence = sd(dt$import_dependence_volume, na.rm = TRUE),
+    sd_supplier_concentration_hhi = sd(dt$supplier_hhi_volume, na.rm = TRUE),
+    sd_exporter_risk = sd(dt$weighted_exporter_risk_volume, na.rm = TRUE),
+    sd_import_dependence_norm = component_sds['import_dependence'],
+    sd_supplier_concentration_norm = component_sds['supplier_concentration'],
+    sd_exporter_risk_norm = component_sds['exporter_risk'],
+    dominant_variable_component = dominant_component,
+    n_years = nrow(dt)
+  )
+}
+
+table_s6_temporal_variability <- species_main[
+  order(species_group, year),
+  calc_temporal_variability(.SD),
+  by = species_group
+][order(-sd_risk, -mean_abs_annual_change)]
+
+table_s6_temporal_variability_rounded <- copy(table_s6_temporal_variability)
+round_cols_s6 <- names(table_s6_temporal_variability_rounded)[
+  vapply(table_s6_temporal_variability_rounded, is.numeric, logical(1))
+]
+table_s6_temporal_variability_rounded[
+  ,
+  (round_cols_s6) := lapply(.SD, function(x) round(x, 3)),
+  .SDcols = round_cols_s6
+]
+
+# =========================================================
+# SECTION 8. FIGURE 1. BAR CHART OF U.S.-SDRI BY SPECIES
+# =========================================================
+bar_plot <- ggplot(
+  species_rank_mean[order(mean_risk)],
+  aes(x = reorder(species_label, mean_risk), y = mean_risk, fill = mean_risk)
+) +
+  geom_col(width = 0.72, color = 'grey20', linewidth = 0.25) +
+  coord_flip() +
+  geom_text(aes(label = sprintf('%.2f', mean_risk)), hjust = -0.08, size = 3.4, color = 'grey15') +
+  scale_y_continuous(
+    limits = c(0, max(species_rank_mean$mean_risk, na.rm = TRUE) * 1.12),
+    labels = number_format(accuracy = 0.01)
+  ) +
+  scale_fill_gradient(low = '#B8D8E8', high = '#0B4F6C', guide = 'none') +
+  labs(
+    x = NULL,
+    y = 'Mean seafood dependency risk index',
+    title = NULL,
+    subtitle = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+theme( panel.grid.major.y = element_blank(), panel.grid.minor = element_blank(), plot.title = element_text(face = 'bold'), plot.subtitle = element_text(color = 'grey30'), axis.title.y = element_blank(), axis.text.y = element_text(color = 'grey15'), axis.text.x = element_text(color = 'grey15'), plot.margin = margin(12, 30, 12, 12) )
+
+# =========================================================
+# SECTION 9. FIGURE 2. COMPONENT PROFILE HEATMAP
+# ---------------------------------------------------------
+# =========================================================
+component_plot_dt <- copy(species_rank_mean)
+component_plot_dt[, dep_norm := minmax01(mean_import_dependence)]
+component_plot_dt[, conc_norm := minmax01(mean_hhi)]
+component_plot_dt[, vuln_norm := minmax01(mean_exporter_risk)]
+
+component_plot_long <- melt(
+  component_plot_dt[
+    ,
+    .(
+      species_label,
+      mean_risk,
+      mean_import_dependence,
+      mean_hhi,
+      mean_exporter_risk,
+      dep_norm,
+      conc_norm,
+      vuln_norm
+    )
+  ],
+  id.vars = c('species_label', 'mean_risk', 'mean_import_dependence', 'mean_hhi', 'mean_exporter_risk'),
+  measure.vars = c('dep_norm', 'conc_norm', 'vuln_norm'),
+  variable.name = 'component',
+  value.name = 'component_norm'
+)
+
+component_plot_long[, component_label := fifelse(
+  component == 'dep_norm', 'Import dependence',
+  fifelse(component == 'conc_norm', 'Supplier concentration', 'Exporter risk')
+)]
+component_plot_long[, component_label := factor(component_label, levels = c('Import dependence', 'Supplier concentration', 'Exporter risk'))]
+
+component_plot_long[, component_value := fifelse(
+  component == 'dep_norm', mean_import_dependence,
+  fifelse(component == 'conc_norm', mean_hhi, mean_exporter_risk)
+)]
+
+component_profile_plot <- ggplot(
+  component_plot_long,
+  aes(x = component_label, y = reorder(species_label, mean_risk), fill = component_norm)
+) +
+  geom_tile(color = 'white', linewidth = 0.5) +
+  geom_text(aes(label = sprintf('%.2f', component_value)), size = 3.2, color = 'grey10') +
+  scale_x_discrete(position = "top") +
+  scale_fill_gradient(
+    low = '#F1F5F9',
+    high = '#B22222',
+    labels = number_format(accuracy = 0.01),
+    name = 'Relative intensity'
+  ) +
+labs( x = NULL, y = NULL, title = '', subtitle = '' ) +
+  theme_minimal(base_size = 13) +
+theme( plot.title = element_text(face = 'bold'), plot.subtitle = element_text(color = 'grey30'), panel.grid = element_blank(), axis.text.x.top = element_text(color = 'grey15'), axis.text.x.bottom = element_blank(), axis.ticks.x.bottom = element_blank(), axis.text.y = element_text(color = 'grey15'), legend.title = element_text(face = 'bold') )
+
+# =========================================================
+# SECTION 10. FIGURE 3. SELF-RELIANCE VS U.S.-SDRI
+# ---------------------------------------------------------
+# =========================================================
+
+self_reliance_dt <- copy(species_rank_mean)
+
+self_reliance_dt[, `:=`(
+  label_nudge_x = 0,
+  label_nudge_y = 0
+)]
+
+self_reliance_dt[species_label == 'Tilapia', `:=`(label_nudge_x = -0.025, label_nudge_y = -0.018)]
+self_reliance_dt[species_label == 'Tuna', `:=`(label_nudge_x = -0.025, label_nudge_y = 0.010)]
+self_reliance_dt[species_label == 'Trout', `:=`(label_nudge_x = -0.030, label_nudge_y = -0.010)]
+self_reliance_dt[species_label == 'Lobster', `:=`(label_nudge_x = -0.040, label_nudge_y = -0.010)]
+self_reliance_dt[species_label == 'Shrimp', `:=`(label_nudge_x = 0.020, label_nudge_y = 0.010)]
+self_reliance_dt[species_label == 'Snapper / grouper', `:=`(label_nudge_x = -0.025, label_nudge_y = -0.012)]
+self_reliance_dt[species_label == 'Sablefish', `:=`(label_nudge_x = -0.085, label_nudge_y = 0.025)]
+self_reliance_dt[species_label == 'Other groundfish', `:=`(label_nudge_x = -0.030, label_nudge_y = -0.012)]
+self_reliance_dt[species_label == 'Pollock', `:=`(label_nudge_x = -0.020, label_nudge_y = -0.012)]
+self_reliance_dt[species_label == 'Herring', `:=`(label_nudge_x = -0.020, label_nudge_y = -0.012)]
+self_reliance_dt[species_label == 'Oysters', `:=`(label_nudge_x = -0.020, label_nudge_y = -0.012)]
+
+self_reliance_plot <- ggplot(
+  self_reliance_dt,
+  aes(
+    x = mean_self_reliance,
+    y = mean_risk,
+    size = mean_hhi,
+    color = mean_exporter_risk
+  )
+) +
+  geom_point(alpha = 0.92) +
+  ggrepel::geom_text_repel( aes(label = species_label), size = 3.3, nudge_x = self_reliance_dt$label_nudge_x, nudge_y = self_reliance_dt$label_nudge_y, box.padding = 0.45, point.padding = 0.75, force = 3, force_pull = 0.15, max.overlaps = Inf, max.iter = 10000, min.segment.length = 0, segment.color = 'grey55', segment.linewidth = 0.25, seed = 123 ) +
+geom_smooth(data = self_reliance_dt,
+              mapping = aes(x = mean_self_reliance, y = mean_risk),
+              inherit.aes = FALSE, method = 'lm', formula = y ~ x,
+              se = FALSE, linewidth = 0.5, linetype = '22', color = 'grey35') +
+scale_x_continuous( limits = c(-0.05, 1.08), breaks = seq(0, 1, by = 0.25), labels = number_format(accuracy = 0.01) ) +
+scale_y_continuous(labels = number_format(accuracy = 0.01), expand = expansion(mult = c(0.08, 0.08))) +
+scale_size_continuous( range = c(3, 10), name = 'Mean supplier\nconcentration (HHI)', labels = number_format(accuracy = 0.01) ) +
+scale_color_gradient( low = '#9ECAE1', high = '#A50F15', name = 'Mean exporter\nrisk', labels = number_format(accuracy = 0.01) ) +
+labs( x = 'Mean self-reliance (1 - import dependence)', y = 'Mean seafood dependency risk index', title = NULL, subtitle = NULL ) +
+  coord_cartesian(clip = 'off') +
+  theme_minimal(base_size = 13) +
+theme( panel.grid.minor = element_blank(), axis.text = element_text(color = 'grey15'), axis.title = element_text(color = 'grey15'), legend.title = element_text(face = 'bold'), plot.margin = margin(12, 45, 12, 20) )
+
+# =========================================================
+# SECTION 11. FIGURE B. COMPONENT SCATTERPLOT
+# =========================================================
+component_scatter_plot <- ggplot(
+  species_rank_mean,
+  aes(
+    x = mean_import_dependence,
+    y = mean_hhi,
+    size = mean_exporter_risk,
+    color = mean_risk,
+    label = species_label
+  )
+) +
+geom_point(alpha = 0.92, stroke = 0.3) + ggrepel::geom_text_repel( size = 4, box.padding = 0.7, point.padding = 0.5, force = 3, force_pull = 0.2, max.overlaps = Inf, min.segment.length = 0, segment.color = "grey60", segment.size = 0.3, seed = 123) +
+scale_x_continuous( limits = c(0, 1), breaks = seq(0, 1, 0.25), labels = number_format(accuracy = 0.01) ) +
+scale_y_continuous( limits = c(0, 1), breaks = seq(0, 1, 0.25), labels = number_format(accuracy = 0.01) ) +
+scale_size_continuous( range = c(2.5, 9), breaks = c(0.30, 0.35, 0.40, 0.45), labels = number_format(accuracy = 0.01), name = "Mean exporter risk") +
+scale_color_gradient( low = "#86BBD8", high = "#C81D25", name = "Mean risk index", labels = number_format(accuracy = 0.01) ) +
+labs( x = "Mean import dependence", y = "Mean supplier concentration (HHI)", title = NULL, subtitle = NULL ) +
+theme_minimal(base_size = 13) +
+theme( plot.title = element_text(face = "bold"), plot.subtitle = element_text(color = "grey30"), legend.position = "right", legend.title = element_text(face = "bold"), panel.grid.minor = element_blank(), axis.text = element_text(color = "grey15"), axis.title = element_text(color = "grey15") )
+
+# =========================================================
+# SECTION 12. FIGURE C. TOP-8 RISK TRAJECTORIES
+# =========================================================
+top8_species <- species_rank_mean[seq_len(min(8L, .N)), species_group]
+species_rank_annual_top8 <- species_rank_annual[species_group %in% top8_species]
+plot_dt <- merge(
+  CJ(year = analysis_years, species_group = top8_species, unique = TRUE),
+  species_rank_annual_top8, by = c('year','species_group'), all.x = TRUE
+)
+plot_dt[, species_label := pretty_species[species_group]]
+setorder(plot_dt, species_group, year)
+plot_dt[, risk_ma3 := if (.N >= 3L) {
+  zoo::rollapplyr(risk_index, width = 3L, FUN = function(v) {
+    if (all(is.finite(v))) mean(v) else NA_real_
+  }, fill = NA_real_, partial = FALSE)
+} else rep(NA_real_, .N), by = species_group]
+label_dt <- plot_dt[is.finite(risk_index), .SD[which.max(year)], by = species_group]
+label_dt[, label_y := fifelse(is.finite(risk_ma3), risk_ma3, risk_index)]
+
+pal <- setNames(
+  grDevices::hcl.colors(length(unique(plot_dt$species_label)), 'Dark 3'),
+  sort(unique(plot_dt$species_label))
+)
+
+trend_plot <- ggplot(
+  plot_dt,
+  aes(x = year, group = species_label, color = species_label)
+) +
+  geom_line(aes(y = risk_index), linewidth = 0.35, alpha = 0.22, lineend = 'round', show.legend = FALSE) +
+  geom_point(aes(y = risk_index), size = 0.65, alpha = 0.35, show.legend = FALSE) +
+  geom_line(aes(y = risk_ma3), linewidth = 1.15, lineend = 'round', na.rm = TRUE, show.legend = FALSE) +
+  geom_point(data = label_dt, aes(y = label_y), size = 1.8, na.rm = TRUE, show.legend = FALSE) +
+  ggrepel::geom_text_repel(
+    data = label_dt,
+    aes(y = label_y, label = species_label),
+    direction = 'y', hjust = 0, nudge_x = 0.8, box.padding = 0.18,
+    point.padding = 0.12, min.segment.length = 0, segment.color = 'grey65',
+    segment.size = 0.25, size = 3.1, seed = 123, na.rm = TRUE, show.legend = FALSE
+  ) +
+  scale_color_manual(values = pal) +
+  scale_x_continuous(breaks = sort(unique(c(seq(analysis_start_year, analysis_end_year, by = 4), analysis_end_year))), expand = expansion(mult = c(0.01, 0.18))) +
+  scale_y_continuous(labels = number_format(accuracy = 0.01)) +
+  coord_cartesian(clip = 'off') +
+labs( x = NULL, y = 'Seafood dependency risk index', title = NULL, subtitle = NULL ) +
+  theme_classic(base_size = 9) +
+theme( plot.title = element_text(face = 'bold', size = 10), plot.subtitle = element_text(size = 8, color = 'grey30'), axis.title.y = element_text(size = 9), axis.text = element_text(size = 8, color = 'black'), axis.line = element_line(color = 'black', linewidth = 0.3), plot.margin = margin(6, 80, 6, 6) )
+
+# =========================================================
+# SECTION 13. SAVE TABLE OUTPUTS
+# =========================================================
+fwrite(table1_coverage, file.path(results_table_dir, 'Table_A_data_species_coverage.csv'))
+fwrite(table2_species_components, file.path(results_table_dir, 'Table_B_component_values_by_species.csv'))
+fwrite(supp_table_rank_change, file.path(results_table_dir, 'Table_C_rank_change_self_reliance_vs_us_sdri.csv'))
+fwrite(species_rank_components, file.path(results_table_dir, 'Table_D_robustness_component_diagnostics.csv'))
+fwrite(top_risk_species_years, file.path(results_table_dir, 'Table_E_top_risk_species_years_clean.csv'))
+fwrite(table_s6_temporal_variability_rounded, file.path(results_table_dir, 'Table_F_temporal_variability_us_sdri.csv'))
+
+fwrite(species_rank_mean[, .(species_group, species_label, mean_risk,
+                             mean_import_dependence, mean_hhi, mean_exporter_risk)],
+       file.path(results_table_dir, 'Figure_1_species_mean_risk_bar_values.csv'))
+fwrite(component_plot_long,
+       file.path(results_table_dir, 'Figure_2_component_profiles_values.csv'))
+fwrite(self_reliance_dt,
+       file.path(results_table_dir, 'Figure_3_self_reliance_vs_us_sdri_values.csv'))
+fwrite(species_rank_mean,
+       file.path(results_table_dir, 'Figure_B_species_risk_components_scatter_values.csv'))
+fwrite(plot_dt,
+       file.path(results_table_dir, 'Figure_C_species_risk_trends_top8_3yr_values.csv'))
+
+# =========================================================
+# SECTION 14. SAVE FIGURE OUTPUTS
+# =========================================================
+ggsave(file.path(results_figure_dir, 'Figure_1_species_mean_risk_bar.png'),
+       plot = bar_plot, width = 10, height = 7, dpi = figure_dpi, bg = 'white')
+ggsave(file.path(results_figure_dir, 'Figure_2_component_profiles_heatmap.png'),
+       plot = component_profile_plot, width = 10.5, height = 7.5,
+       dpi = figure_dpi, bg = 'white')
+ggsave(file.path(results_figure_dir, 'Figure_3_self_reliance_vs_us_sdri.png'),
+       plot = self_reliance_plot, width = 11, height = 7.5,
+       dpi = figure_dpi, bg = 'white')
+ggsave(file.path(results_figure_dir, 'Figure_B_species_risk_components_scatter.png'),
+       plot = component_scatter_plot, width = 12, height = 8,
+       dpi = figure_dpi, bg = 'white')
+ggsave(file.path(results_figure_dir, 'Figure_C_species_risk_trends_top8_3yr_av.png'),
+       plot = trend_plot, width = 11, height = 7,
+       dpi = figure_dpi, bg = 'white')
+
+print(bar_plot)
+print(component_profile_plot)
+print(self_reliance_plot)
+print(component_scatter_plot)
+print(trend_plot)
+
+```
+
+# Generate supplementary tables and internal checks
+
+```{r supplementary-and-checks}
+# Generate supplementary tables and internal checks
+
+# ============================================================
+# SECTION 1. INPUTS AND SCORING HELPERS
+# ============================================================
+if (!exists('species_main') || !exists('trade_country_species_year_risk') ||
+    !exists('normalization_reference')) {
+  stop('Run prepare-inputs and generate-results first.')
+}
+primary_country_column <- if (primary_exporter_metric == 'ndgain_vulnerability') {
+  'ndgain_vulnerability'
+} else 'ndgain_combined_vuln_readiness'
+secondary_country_column <- if (secondary_exporter_metric == 'ndgain_vulnerability') {
+  'ndgain_vulnerability'
+} else 'ndgain_combined_vuln_readiness'
+
+source_detail <- copy(trade_country_species_year_risk)[
+  species_group %in% main_species & is.finite(import_volume_kg) & import_volume_kg > 0
+]
+source_detail[, species_label := pretty_species[species_group]]
+source_detail[, primary_country_risk := get(primary_country_column)]
+source_detail[, reported_source_id := paste(
+  fifelse(is.na(iso3c), 'UNMAPPED', iso3c), country_name, sep = ' | '
+)]
+assert_unique(source_detail, c('year','species_group','reported_source_id'), 'source_detail')
+setorder(source_detail, year, species_group, -import_volume_kg, country_name)
+source_detail[, supplier_order := seq_len(.N), by = .(year, species_group)]
+fwrite(source_detail, file.path(source_profile_checks_dir, 'Source_country_species_year_detail.csv'))
+
+score_on_fixed_reference <- function(id, hhi, er) {
+  raw <- c(import_dependence_volume = id, supplier_hhi_volume = hhi,
+           weighted_exporter_risk_volume = er)
+  rr <- normalization_reference[match(names(raw), input_column)]
+  z <- (raw - rr$minimum) / (rr$maximum - rr$minimum)
+  names(z) <- c('ID_normalized','HHI_normalized','ER_normalized')
+  valid <- all(is.finite(z))
+  in_range <- valid && all(z >= -1e-10 & z <= 1 + 1e-10)
+  score <- if (in_range) prod(pmin(pmax(z, 0), 1))^(1/3) else NA_real_
+  list(score = score, z = z, valid = valid, in_range = in_range)
+}
+
+# ============================================================
+# SECTION 2. TABLE G. REPORTED SOURCE-COUNTRY PROFILES
+# ============================================================
+source_profile_annual <- source_detail[, {
+  v <- import_volume_kg
+  sh <- v / sum(v)
+  top <- which.max(v)
+  known <- is.finite(primary_country_risk)
+  cov <- sum(sh[known])
+  list(
+    total_import_volume_kg = sum(v),
+    largest_reported_source = country_name[top],
+    largest_source_iso3c = iso3c[top],
+    largest_source_share = sh[top],
+    largest_source_tie_count = sum(v == max(v)),
+    top_three_share = sum(sort(sh, decreasing = TRUE)[seq_len(min(3L, .N))]),
+    n_reported_sources = .N,
+    n_mapped_ISO_codes = uniqueN(iso3c[!is.na(iso3c)]),
+    hhi = sum(sh^2),
+    exporter_risk_coverage = cov,
+    import_weighted_exporter_risk = if (cov > 0) {
+      sum(sh[known] * primary_country_risk[known]) / cov
+    } else NA_real_
+  )
+}, by = .(year, species_group, species_label)]
+
+source_profile_annual <- merge(
+  source_profile_annual,
+  species_main[, .(year, species_group,
+                    import_dependence = import_dependence_volume,
+                    us_sdri = seafood_dependency_risk_index)],
+  by = c('year', 'species_group'), all.x = TRUE
+)
+setorder(source_profile_annual, year, -us_sdri)
+
+source_profile_snapshot_full <- source_profile_annual[year == source_profile_year]
+source_profile_snapshot <- source_profile_snapshot_full[, .(
+  year,
+  species_group,
+  species_label,
+  largest_reported_source,
+  largest_source_share,
+  top_three_share,
+  n_reported_sources,
+  hhi,
+  exporter_risk_coverage,
+  import_dependence,
+  us_sdri
+)]
+setorder(source_profile_snapshot, -us_sdri)
+
+fwrite(source_profile_snapshot,
+       file.path(results_table_dir, 'Table_G_source_country_profiles.csv'))
+fwrite(source_profile_annual,
+       file.path(source_profile_checks_dir, 'Source_country_profiles_all_selected_years.csv'))
+
+source_profile_period <- source_profile_annual[, .(
+  n_years = uniqueN(year),
+  mean_annual_largest_source_share = mean_finite(largest_source_share),
+  mean_annual_top_three_share = mean_finite(top_three_share),
+  mean_annual_n_reported_sources = mean_finite(n_reported_sources),
+  mean_annual_hhi = mean_finite(hhi),
+  mean_annual_exporter_risk_coverage = mean_finite(exporter_risk_coverage)
+), by = .(species_group, species_label)]
+fwrite(source_profile_period,
+       file.path(source_profile_checks_dir, 'Source_country_profiles_period_means.csv'))
+
+# ============================================================
+# SECTION 3. RANKING COMPARISON SUMMARY
+# ============================================================
+rank_comparison <- copy(supp_table_rank_change)
+rank_comparison <- merge(
+  rank_comparison,
+  species_rank_mean[, .(species_group, mean_import_dependence)],
+  by = 'species_group', all.x = TRUE
+)
+rank_comparison[, rank_import_dependence :=
+                  frank(-mean_import_dependence, ties.method = 'min', na.last = 'keep')]
+setorder(rank_comparison, -abs_rank_change, rank_risk)
+
+valid_ranks <- rank_comparison[is.finite(rank_risk) & is.finite(rank_import_dependence)]
+rank_summary <- data.table(
+  statistic = c('n_groups_compared', 'n_groups_changing_rank',
+                'mean_absolute_rank_change', 'max_absolute_rank_change',
+                'spearman_rank_correlation_descriptive'),
+  value = c(
+    nrow(valid_ranks),
+    sum(valid_ranks$rank_risk != valid_ranks$rank_import_dependence),
+    mean_finite(abs(valid_ranks$rank_risk - valid_ranks$rank_import_dependence)),
+    max_abs_finite(valid_ranks$rank_risk - valid_ranks$rank_import_dependence),
+    if (nrow(valid_ranks) > 2L && uniqueN(valid_ranks$rank_risk) > 1L &&
+        uniqueN(valid_ranks$rank_import_dependence) > 1L) {
+      cor(valid_ranks$rank_risk, valid_ranks$rank_import_dependence, method = 'spearman')
+    } else NA_real_
+  )
+)
+fwrite(rank_comparison,
+       file.path(ranking_checks_dir, 'Ranking_comparison_detail.csv'))
+fwrite(rank_summary,
+       file.path(ranking_checks_dir, 'Ranking_comparison_summary.csv'))
+
+# ============================================================
+# SECTION 4. TABLE H. ILLUSTRATIVE SOURCING REALLOCATION
+# ============================================================
+scenario_rows <- list()
+scenario_country_rows <- list()
+
+for (sg in main_species) {
+  d <- copy(source_detail[year == scenario_year & species_group == sg])
+  base <- species_main[year == scenario_year & species_group == sg]
+  basic <- data.table(
+    species_group = sg,
+    species_label = pretty_species[sg],
+    year = scenario_year,
+    fraction_of_largest_supplier_volume = scenario_reallocation_fraction
+  )
+  if (!nrow(d) || nrow(base) != 1L) {
+    basic[, status := 'not_evaluated_no_imports_or_no_species_year']
+    scenario_rows[[sg]] <- basic
+    next
+  }
+  setorder(d, -import_volume_kg, country_name)
+  old_v <- d$import_volume_kg
+  total <- sum(old_v)
+  other_total <- total - old_v[1]
+  if (nrow(d) < 2L || other_total <= 0) {
+    basic[, `:=`(
+      status = 'not_evaluated_no_existing_alternative_supplier',
+      largest_reported_source = d$country_name[1]
+    )]
+    scenario_rows[[sg]] <- basic
+    next
+  }
+
+  transfer <- scenario_reallocation_fraction * old_v[1]
+  new_v <- old_v
+  new_v[1] <- old_v[1] - transfer
+  new_v[-1] <- old_v[-1] + transfer * old_v[-1] / other_total
+  if (abs(sum(new_v) - total) > 1e-8 * max(1, total) || any(new_v < 0)) {
+    stop('Scenario failed the fixed-total/nonnegative-volume check for ', sg)
+  }
+
+  p0 <- old_v / total
+  p1 <- new_v / total
+  known <- is.finite(d$primary_country_risk)
+  c0 <- sum(p0[known])
+  c1 <- sum(p1[known])
+  er0 <- if (c0 > 0) sum(p0[known] * d$primary_country_risk[known]) / c0 else NA_real_
+  er1 <- if (c1 > 0) sum(p1[known] * d$primary_country_risk[known]) / c1 else NA_real_
+  h0 <- sum(p0^2)
+  h1 <- sum(p1^2)
+  id <- base$import_dependence_volume[1]
+  score0 <- score_on_fixed_reference(id, h0, er0)
+  score1 <- score_on_fixed_reference(id, h1, er1)
+
+  if (is.finite(base$supplier_hhi_volume) && abs(h0 - base$supplier_hhi_volume) > 1e-8) {
+    stop('Scenario baseline HHI does not reproduce the main panel for ', sg)
+  }
+  if (is.finite(er0) && is.finite(base$weighted_exporter_risk_volume) &&
+      abs(er0 - base$weighted_exporter_risk_volume) > 1e-8) {
+    stop('Scenario baseline exporter risk does not reproduce the main panel for ', sg)
+  }
+  if (is.finite(score0$score) && is.finite(base$seafood_dependency_risk_index) &&
+      abs(score0$score - base$seafood_dependency_risk_index) > 1e-8) {
+    stop('Scenario baseline index does not reproduce the main panel for ', sg)
+  }
+
+  status <- if (!score1$valid) {
+    'not_scored_missing_component_or_constant_reference'
+  } else if (!score1$in_range) {
+    'not_scored_outside_fixed_normalization_reference'
+  } else {
+    'evaluated'
+  }
+
+  basic[, `:=`(
+    status = status,
+    largest_reported_source = d$country_name[1],
+    largest_source_share_before = p0[1],
+    largest_source_share_after = p1[1],
+    import_dependence_held_fixed = id,
+    hhi_before = h0,
+    hhi_after = h1,
+    exporter_risk_before = er0,
+    exporter_risk_after = er1,
+    exporter_risk_coverage_before = c0,
+    exporter_risk_coverage_after = c1,
+    us_sdri_before = score0$score,
+    us_sdri_after = score1$score,
+    us_sdri_change = score1$score - score0$score
+  )]
+  scenario_rows[[sg]] <- basic
+
+  d[, `:=`(
+    import_volume_before = old_v,
+    import_volume_after = new_v,
+    share_before = p0,
+    share_after = p1
+  )]
+  scenario_country_rows[[sg]] <- d[, .(
+    year, species_group, species_label, reported_source_id, iso3c, country_name,
+    primary_country_risk, import_volume_before, import_volume_after,
+    share_before, share_after
+  )]
+}
+
+scenario_results <- rbindlist(scenario_rows, fill = TRUE)
+fwrite(scenario_results,
+       file.path(scenario_checks_dir, 'Illustrative_sourcing_scenario_all_core_groups.csv'))
+if (length(scenario_country_rows)) {
+  fwrite(rbindlist(scenario_country_rows, fill = TRUE),
+         file.path(scenario_checks_dir, 'Illustrative_sourcing_scenario_country_calculations.csv'))
+}
+
+scenario_public <- scenario_results[
+  species_group %in% scenario_species & status == 'evaluated',
+  .(
+    year,
+    species_group,
+    species_label,
+    largest_reported_source,
+    fraction_of_largest_supplier_volume,
+    largest_source_share_before,
+    largest_source_share_after,
+    import_dependence_held_fixed,
+    hhi_before,
+    hhi_after,
+    exporter_risk_before,
+    exporter_risk_after,
+    us_sdri_before,
+    us_sdri_after,
+    us_sdri_change
+  )
+]
+scenario_public[, scenario_order := match(species_group, scenario_species)]
+setorder(scenario_public, scenario_order)
+scenario_public[, scenario_order := NULL]
+if (!setequal(scenario_public$species_group, scenario_species)) {
+  stop('One or more selected Table H species could not be evaluated.')
+}
+fwrite(scenario_public,
+       file.path(results_table_dir, 'Table_H_illustrative_sourcing_scenario.csv'))
+
+# ============================================================
+# SECTION 5. OUTPUT MANIFEST
+# ============================================================
+output_manifest <- data.table(
+  journal_label = c(
+    'Table A', 'Table B', 'Table C', 'Table D', 'Table E', 'Table F',
+    'Table G', 'Table H', 'Fig 1', 'Fig 2', 'Fig 3',
+    'Figure A', 'Figure B', 'Figure C'
+  ),
+  output_type = c(
+    rep('Supplementary table', 8), rep('Main figure', 3),
+    rep('Supplementary figure', 3)
+  ),
+  file_name = c(
+    'Table_A_data_species_coverage.csv',
+    'Table_B_component_values_by_species.csv',
+    'Table_C_rank_change_self_reliance_vs_us_sdri.csv',
+    'Table_D_robustness_component_diagnostics.csv',
+    'Table_E_top_risk_species_years_clean.csv',
+    'Table_F_temporal_variability_us_sdri.csv',
+    'Table_G_source_country_profiles.csv',
+    'Table_H_illustrative_sourcing_scenario.csv',
+    'Figure_1_species_mean_risk_bar.png',
+    'Figure_2_component_profiles_heatmap.png',
+    'Figure_3_self_reliance_vs_us_sdri.png',
+    'Embedded in S1 File; not generated by this script',
+    'Figure_B_species_risk_components_scatter.png',
+    'Figure_C_species_risk_trends_top8_3yr_av.png'
+  ),
+  title_or_caption = c(
+    paste0('Data and species coverage, ', analysis_start_year, '–', analysis_end_year, '.'),
+    paste0('Mean component values and U.S.-SDRI by seafood group, ', analysis_start_year, '–', analysis_end_year, '.'),
+    paste0('Rank change from self-reliance to the U.S.-SDRI, ', analysis_start_year, '–', analysis_end_year, '.'),
+    paste0('Robustness and component diagnostics for species-level U.S.-SDRI rankings, ', analysis_start_year, '–', analysis_end_year, '.'),
+    paste0('Highest U.S.-SDRI species-year observations, ', analysis_start_year, '–', analysis_end_year, '.'),
+    paste0('Temporal variability in species-level U.S. Seafood Dependency Risk Index values, ', analysis_start_year, '–', analysis_end_year, '.'),
+    paste0('Reported source-country concentration profiles for U.S. seafood groups, ', source_profile_year, '.'),
+    paste0('Illustrative sourcing reallocation for selected U.S. seafood groups, ', scenario_year, '.'),
+    paste0('Mean species-specific seafood dependency risk in the U.S., ', analysis_start_year, '–', analysis_end_year, '.'),
+    paste0('Mean U.S.-SDRI component profiles across seafood groups, ', analysis_start_year, '–', analysis_end_year, '.'),
+    paste0('Relationship between self-reliance and seafood dependency risk by species group, ', analysis_start_year, '–', analysis_end_year, '.'),
+    'Conceptual framework for constructing the U.S. Seafood Dependency Risk Index (U.S.-SDRI).',
+    paste0('Species-level seafood dependency risk components for U.S. seafood groups, ', analysis_start_year, '–', analysis_end_year, '.'),
+    paste0('Risk trajectories among the eight highest-risk seafood groups, ', analysis_start_year, '–', analysis_end_year, '.')
+  ),
+  manuscript_location = c(
+    rep('S1 File', 8), 'Main manuscript', 'Main manuscript', 'Main manuscript',
+    'S1 File', 'S1 File', 'S1 File'
+  ),
+  description = c(
+    'Coverage of harmonized trade and domestic landings within the selected analytical period.',
+    'Mean import dependence, self-reliance, supplier concentration, exporter risk, and composite U.S.-SDRI.',
+    'Species rank changes between self-reliance and the multidimensional U.S.-SDRI.',
+    'Primary and secondary exporter-risk specifications and component-ranking diagnostics.',
+    'Highest annual species-group U.S.-SDRI observations and component values.',
+    'Mean, dispersion, annual-change, and component-variability diagnostics.',
+    'Largest reported source, largest-source share, top-three share, supplier count, HHI, exporter-risk coverage, import dependence, and U.S.-SDRI.',
+    paste0('Fixed-volume illustrative reallocation of ', scenario_reallocation_fraction * 100, '% of the largest reported supplier volume among existing alternative suppliers for selected species.'),
+    'Mean U.S.-SDRI ranking across the 22 core seafood groups.',
+    'Mean component values and relative component intensity across seafood groups.',
+    'Descriptive relationship between mean self-reliance and mean U.S.-SDRI; point size is HHI and point color is exporter risk.',
+    'Conceptual workflow showing data streams, harmonization, U.S.-SDRI components, normalization, and outputs.',
+    'Scatterplot of mean import dependence and supplier concentration; point size is exporter risk and point color is mean U.S.-SDRI.',
+    'Annual and three-year moving-average U.S.-SDRI trajectories for the eight highest-risk groups.'
+  )
+)
+fwrite(output_manifest, file.path(project_dir, 'outputs', 'Output_Manifest.csv'))
+
+# ============================================================
+# SECTION 6. SESSION INFORMATION
+# ============================================================
+writeLines(capture.output(sessionInfo()), file.path(diagnostics_dir, 'sessionInfo.txt'))
+package_versions <- data.table(
+  package = required_packages,
+  version = vapply(required_packages, function(p) as.character(packageVersion(p)), character(1))
+)
+fwrite(package_versions, file.path(diagnostics_dir, 'package_versions.csv'))
+
+```

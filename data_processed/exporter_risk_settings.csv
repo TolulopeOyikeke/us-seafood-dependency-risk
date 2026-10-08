@@ -1,0 +1,2 @@
+primary_exporter_metric,secondary_exporter_metric,combined_vulnerability_weight,combined_readiness_risk_weight
+ndgain_combined_vuln_readiness,ndgain_vulnerability,0.5,0.5

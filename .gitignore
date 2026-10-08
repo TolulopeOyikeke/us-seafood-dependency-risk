@@ -1,0 +1,14 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+
+_revision_internal/
+data_raw/
+
+outputs/results_figures/Figure_A_conceptual_framework.png
+outputs/Output_Manifest.csv
+
+.DS_Store
+__MACOSX/
